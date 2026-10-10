@@ -1,10 +1,10 @@
-package me.wolfii;
+package me.wolfii.effectivecaveculling;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public final class Cavefill {
-	public static final String MOD_ID = "cavefill";
+	public static final String MOD_ID = "effectivecaveculling";
 	public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
 	/**

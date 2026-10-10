@@ -1,6 +1,6 @@
-package me.wolfii.mixin;
+package me.wolfii.effectivecaveculling.mixin;
 
-import me.wolfii.CavefillController;
+import me.wolfii.effectivecaveculling.CavefillController;
 import net.minecraft.client.multiplayer.MultiPlayerGameMode;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;

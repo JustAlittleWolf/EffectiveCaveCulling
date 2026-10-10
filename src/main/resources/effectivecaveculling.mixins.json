@@ -1,6 +1,6 @@
 {
 	"required": true,
-	"package": "me.wolfii.mixin",
+	"package": "me.wolfii.effectivecaveculling.mixin",
 	"compatibilityLevel": "JAVA_25",
 	"injectors": {
 		"defaultRequire": 1

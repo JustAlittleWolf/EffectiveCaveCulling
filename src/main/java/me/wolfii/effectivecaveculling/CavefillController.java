@@ -1,9 +1,9 @@
-package me.wolfii;
+package me.wolfii.effectivecaveculling;
 
-import me.wolfii.engine.CaveEngine;
-import me.wolfii.engine.ChunkSnapshot;
-import me.wolfii.engine.PlayerView;
-import me.wolfii.engine.SectionFill;
+import me.wolfii.effectivecaveculling.engine.CaveEngine;
+import me.wolfii.effectivecaveculling.engine.ChunkSnapshot;
+import me.wolfii.effectivecaveculling.engine.PlayerView;
+import me.wolfii.effectivecaveculling.engine.SectionFill;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import java.util.BitSet;
 import java.util.List;

@@ -1,4 +1,4 @@
-package me.wolfii;
+package me.wolfii.effectivecaveculling;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;

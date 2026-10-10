@@ -1,6 +1,6 @@
-package me.wolfii.engine;
+package me.wolfii.effectivecaveculling.engine;
 
-import me.wolfii.Cavefill;
+import me.wolfii.effectivecaveculling.Cavefill;
 import it.unimi.dsi.fastutil.ints.Int2ByteOpenHashMap;
 import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
@@ -29,7 +29,7 @@ public final class CaveEngine {
 	private static final int UNSET = 127;
 
 	private final ExecutorService worker = Executors.newSingleThreadExecutor(runnable -> {
-		Thread thread = new Thread(runnable, "cavefill-solver");
+		Thread thread = new Thread(runnable, "effectivecaveculling-solver");
 		thread.setDaemon(true);
 		return thread;
 	});
