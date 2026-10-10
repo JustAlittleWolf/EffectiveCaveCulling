@@ -62,10 +62,12 @@ public final class CavefillController {
 			catchUp = true;
 			return;
 		}
-		if (catchUp || level == null) {
-			catchUp = true;
-			publishCatchUp(minecraft);
+		if (!prepare(chunk.getLevel())) {
 			return;
+		}
+		if (catchUp) {
+			publishLoaded((ClientLevel) minecraft.level);
+			catchUp = false;
 		}
 		ENGINE.publishAndWait(ChunkSnapshot.capture(chunk), playerView());
 		apply(ENGINE.drain(), chunk);
@@ -148,7 +150,9 @@ public final class CavefillController {
 
 	private static void noteInactive(Minecraft minecraft) {
 		if (level != null) {
-			deactivate();
+			// Quitting nulls the client level and the section tracker before this tick. Restoring then crashes,
+			// and the world is already going away, so the fake blocks can be dropped.
+			deactivate(minecraft.level == level);
 		}
 		if (minecraft.level instanceof ClientLevel client && !client.isDebug() && minecraft.player != null) {
 			catchUp = true;
@@ -157,8 +161,10 @@ public final class CavefillController {
 		}
 	}
 
-	private static void deactivate() {
-		restoreAll();
+	private static void deactivate(boolean restore) {
+		if (restore) {
+			restoreAll();
+		}
 		ENGINE.resetAndWait();
 		applied.clear();
 		originals.clear();
@@ -290,10 +296,12 @@ public final class CavefillController {
 			} else {
 				applied.put(fill.sectionKey, desired);
 			}
-			if (wasEmpty != section.hasOnlyAir()) {
-				level.getChunkSource().onSectionEmptinessChanged(fill.sectionX, fill.sectionY, fill.sectionZ, section.hasOnlyAir());
+			if (Minecraft.getInstance().level == level) {
+				if (wasEmpty != section.hasOnlyAir()) {
+					level.getChunkSource().onSectionEmptinessChanged(fill.sectionX, fill.sectionY, fill.sectionZ, section.hasOnlyAir());
+				}
+				level.setSectionDirtyWithNeighbors(fill.sectionX, fill.sectionY, fill.sectionZ);
 			}
-			level.setSectionDirtyWithNeighbors(fill.sectionX, fill.sectionY, fill.sectionZ);
 		}
 	}
 
