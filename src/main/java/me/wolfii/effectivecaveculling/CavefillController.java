@@ -157,8 +157,7 @@ public final class CavefillController {
 			publishCatchUp(minecraft);
 		}
 		if (level != null && minecraft.player != null) {
-			int feet = Mth.floor(minecraft.player.getY());
-			if (ENGINE.enqueueVertical(feet > level.getMaxY(), feet < level.getMinY())) {
+			if (ENGINE.enqueueVertical(headAbove(minecraft, level), feetBelow(minecraft, level))) {
 				solverDirty = true;
 			}
 		}
@@ -289,8 +288,15 @@ public final class CavefillController {
 				}
 			}
 		}
-		int feet = Mth.floor(player.getY());
-		return new PlayerView(body, feet > level.getMaxY(), feet < level.getMinY());
+		return new PlayerView(body, headAbove(Minecraft.getInstance(), level), feetBelow(Minecraft.getInstance(), level));
+	}
+
+	private static boolean headAbove(Minecraft minecraft, ClientLevel level) {
+		return Mth.floor(minecraft.player.getBoundingBox().maxY) > level.getMaxY();
+	}
+
+	private static boolean feetBelow(Minecraft minecraft, ClientLevel level) {
+		return Mth.floor(minecraft.player.getY()) < level.getMinY();
 	}
 
 	private static void applyDeferred() {

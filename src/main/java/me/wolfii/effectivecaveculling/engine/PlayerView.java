@@ -3,7 +3,7 @@ package me.wolfii.effectivecaveculling.engine;
 /** Blocks the player occupies, captured on the client thread for a solver pass. */
 public final class PlayerView {
 	public final int[] body;
-	/** Feet are above the inclusive max build height, so the top of the world is open void. */
+	/** The top of the head is above the inclusive max build height, so the top of the world is open void. */
 	public final boolean above;
 	/** Feet are below the inclusive min build height, so the bottom of the world is open void. */
 	public final boolean below;
