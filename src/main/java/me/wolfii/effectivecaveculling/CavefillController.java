@@ -694,8 +694,13 @@ public final class CavefillController {
 		if (!LightEngine.hasDifferentLightProperties(before, after)) {
 			return;
 		}
+		// Some client light mods leave this unset until the chunk is in the cache, and some never
+		// create it. Calling update on null aborts the chunk packet, so the column never loads.
 		if (chunk.getLevel().dimensionType().hasSkyLight()) {
-			chunk.getSkyLightSources().update(chunk, pos.getX() & 15, pos.getY(), pos.getZ() & 15);
+			var sources = chunk.getSkyLightSources();
+			if (sources != null) {
+				sources.update(chunk, pos.getX() & 15, pos.getY(), pos.getZ() & 15);
+			}
 		}
 		chunk.getLevel().getChunkSource().getLightEngine().checkBlock(pos);
 		relight.add(pos.asLong());
