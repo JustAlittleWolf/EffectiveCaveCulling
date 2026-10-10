@@ -1,0 +1,13 @@
+{
+	"required": true,
+	"package": "dev.justalittlewolf.cavefill.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"client": [
+		"ClientChunkCacheMixin",
+		"LevelChunkMixin",
+		"MultiPlayerGameModeMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}

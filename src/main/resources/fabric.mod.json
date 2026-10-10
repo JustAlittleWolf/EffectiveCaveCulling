@@ -1,0 +1,29 @@
+{
+	"schemaVersion": 1,
+	"id": "cavefill",
+	"version": "${version}",
+	"name": "Cave Fill",
+	"description": "Client-side occlusion that fills isolated caves with red concrete before other mods read the chunk, and restores them when a later world change opens them.",
+	"authors": [
+		"JustAlittleWolf"
+	],
+	"license": "MIT",
+	"environment": "client",
+	"entrypoints": {
+		"client": [
+			"dev.justalittlewolf.cavefill.CavefillClient"
+		]
+	},
+	"mixins": [
+		{
+			"config": "cavefill.client.mixins.json",
+			"environment": "client"
+		}
+	],
+	"depends": {
+		"fabricloader": ">=0.19.5",
+		"minecraft": "~26.2",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}
