@@ -12,6 +12,9 @@ import it.unimi.dsi.fastutil.longs.LongArrayList;
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
@@ -20,6 +23,7 @@ import net.minecraft.core.SectionPos;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.util.Mth;
 import net.minecraft.world.item.DyeColor;
+import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.BlockEntity;
@@ -31,8 +35,8 @@ import net.minecraft.world.level.lighting.LightEngine;
 import net.minecraft.world.phys.AABB;
 
 /**
- * Applies solver output to the client world before any other mod is told the chunk exists,
- * and again immediately before a chunk is snapshotted for unload.
+ * Applies solver output to the client world before any other mod is told the chunk exists.
+ * A chunk that is not in the cache yet is solved off the render thread and inserted afterwards.
  * Only the pockets that were filled are remembered, and a chunk that is already loaded only loses fills.
  */
 public final class CavefillController {
@@ -46,6 +50,12 @@ public final class CavefillController {
 	private static final LongArrayList relight = new LongArrayList();
 	/** Unfills of chunks that are already loaded. Applied off the chunk-packet path. */
 	private static final List<SectionFill> deferred = new ArrayList<>();
+	/** Inserts and fill handoffs finished by the solver. Drained on the client thread only. */
+	private static final ConcurrentLinkedQueue<Runnable> clientWork = new ConcurrentLinkedQueue<>();
+	/** Bumped when the client world changes so a solve for the previous world cannot insert. */
+	private static final AtomicInteger worldEpoch = new AtomicInteger();
+	/** Bumped for each packet or drop of a column. An in-flight solve whose token no longer matches is discarded. */
+	private static final ConcurrentHashMap<Long, Integer> generations = new ConcurrentHashMap<>();
 
 	private static ClientLevel level;
 	private static boolean solverDirty;
@@ -60,8 +70,34 @@ public final class CavefillController {
 	}
 
 	/**
-	 * Chunk packet is decoded, but the cache has not published it yet, so Sodium, Voxy, and Bobby
-	 * have not ingested it. Only this column is written here. Neighbor unfills wait for the client tick.
+	 * A chunk the client has not cached yet. The packet returns immediately; the solver fills the chunk,
+	 * and a later client tick inserts it. Cancelling the vanilla insert is only safe when this returns true.
+	 */
+	public static boolean deferFreshChunk(LevelChunk chunk) {
+		Minecraft minecraft = Minecraft.getInstance();
+		if (!CavefillConfig.allows(minecraft)) {
+			catchUp = true;
+			return false;
+		}
+		if (!prepare(chunk.getLevel())) {
+			return false;
+		}
+		if (catchUp) {
+			publishLoaded((ClientLevel) minecraft.level);
+			catchUp = false;
+		}
+		int chunkX = chunk.getPos().x();
+		int chunkZ = chunk.getPos().z();
+		int generation = bump(chunkX, chunkZ);
+		int epoch = worldEpoch.get();
+		PlayerView view = playerView();
+		ENGINE.execute(() -> solveFresh(chunk, view, generation, epoch));
+		return true;
+	}
+
+	/**
+	 * The packet replaced a chunk that is already in the cache. Other mods have already seen it, so this
+	 * only removes fills, and it does not wait for the solver.
 	 */
 	public static void beforeChunkPublished(LevelChunk chunk) {
 		Minecraft minecraft = Minecraft.getInstance();
@@ -76,23 +112,21 @@ public final class CavefillController {
 			publishLoaded((ClientLevel) minecraft.level);
 			catchUp = false;
 		}
-		// The packet just replaced this column, so previous pocket saves no longer match it.
-		forgetColumn(chunk.getPos().x(), chunk.getPos().z());
-		ENGINE.publishAndWait(ChunkSnapshot.capture(chunk), playerView());
-		List<SectionFill> now = new ArrayList<>();
-		for (SectionFill fill : ENGINE.drain()) {
-			if (fill.sectionX == chunk.getPos().x() && fill.sectionZ == chunk.getPos().z()) {
-				now.add(fill);
-			} else {
-				deferred.add(fill);
-			}
+		// The packet just replaced this column. Put the previous pockets back immediately, then let the
+		// solver drop any that the new blocks opened. Loaded columns never gain fills.
+		int chunkX = chunk.getPos().x();
+		int chunkZ = chunk.getPos().z();
+		List<SectionFill> reseal = pocketFills(chunkX, chunkZ);
+		forgetColumn(chunkX, chunkZ);
+		if (!reseal.isEmpty()) {
+			apply(reseal, chunk);
 		}
-		apply(now, chunk);
+		submitLoaded(chunk, true);
 	}
 
 	/**
 	 * Bobby shallow-copies on {@code drop} / view moves, and Voxy ingests there when Bobby is installed.
-	 * Both hook HEAD, so this has to run first. An idle solver has nothing new to publish.
+	 * Publish solves that have already finished. Do not wait for ones that are still running.
 	 */
 	public static void beforeChunkSnapshotted() {
 		if (level == null || !CavefillConfig.allows(Minecraft.getInstance())) {
@@ -101,12 +135,13 @@ public final class CavefillController {
 		if (!prepare(Minecraft.getInstance().level)) {
 			return;
 		}
-		if (solverDirty || !ENGINE.idle()) {
-			ENGINE.flushAndWait(playerView());
-			deferred.addAll(ENGINE.drain());
-			solverDirty = false;
-		}
+		pump();
 		applyDeferred();
+	}
+
+	/** The column was forgotten. An in-flight solve must not insert it afterwards. */
+	public static void invalidateChunk(int chunkX, int chunkZ) {
+		bump(chunkX, chunkZ);
 	}
 
 	public static void afterChunkUnloaded(int chunkX, int chunkZ) {
@@ -161,13 +196,10 @@ public final class CavefillController {
 				solverDirty = true;
 			}
 		}
-		if (ENGINE.flushFinished()) {
-			ENGINE.finishFlush();
-			deferred.addAll(ENGINE.drain());
-		}
 		if (solverDirty && ENGINE.startFlush(playerView())) {
 			solverDirty = false;
 		}
+		pump();
 		applyDeferred();
 		flushRelight();
 	}
@@ -194,16 +226,22 @@ public final class CavefillController {
 	}
 
 	private static void deactivate(boolean restore) {
+		// In-flight solves hand their chunks back. Pump inserts a raw chunk when this world is still showing,
+		// so turning the mod off does not leave a hole where a packet was deferred.
+		worldEpoch.incrementAndGet();
+		ENGINE.resetAndWait();
+		ENGINE.clearClientVertical();
+		pump();
 		if (restore) {
 			restoreAll();
 		}
-		ENGINE.resetAndWait();
-		ENGINE.clearClientVertical();
 		applied.clear();
 		originals.clear();
 		blockEntities.clear();
 		relight.clear();
 		deferred.clear();
+		clientWork.clear();
+		generations.clear();
 		solverDirty = false;
 		level = null;
 	}
@@ -236,16 +274,18 @@ public final class CavefillController {
 			if (chunk == null) {
 				continue;
 			}
-			ENGINE.publishAndWait(ChunkSnapshot.capture(chunk), playerView(), true);
-			deferred.addAll(ENGINE.drain());
+			submitLoaded(chunk, false);
 		}
 	}
 
 	private static boolean prepare(Level current) {
 		if (!(current instanceof ClientLevel client) || client.isDebug()) {
 			if (level != null) {
+				worldEpoch.incrementAndGet();
 				ENGINE.resetAndWait();
 				ENGINE.clearClientVertical();
+				clientWork.clear();
+				generations.clear();
 				applied.clear();
 				originals.clear();
 				blockEntities.clear();
@@ -256,8 +296,11 @@ public final class CavefillController {
 			return false;
 		}
 		if (client != level) {
+			worldEpoch.incrementAndGet();
 			ENGINE.resetAndWait();
 			ENGINE.clearClientVertical();
+			clientWork.clear();
+			generations.clear();
 			applied.clear();
 			originals.clear();
 			blockEntities.clear();
@@ -266,6 +309,224 @@ public final class CavefillController {
 			level = client;
 		}
 		return Minecraft.getInstance().player != null;
+	}
+
+	/** {@code bumpGeneration} invalidates a solve already queued for this column. Catch-up must not do that. */
+	private static void submitLoaded(LevelChunk chunk, boolean bumpGeneration) {
+		int chunkX = chunk.getPos().x();
+		int chunkZ = chunk.getPos().z();
+		int generation = bumpGeneration ? bump(chunkX, chunkZ) : generations.getOrDefault(chunkKey(chunkX, chunkZ), 0);
+		int epoch = worldEpoch.get();
+		PlayerView view = playerView();
+		ChunkSnapshot snapshot = ChunkSnapshot.capture(chunk);
+		ENGINE.execute(() -> {
+			if (!current(chunkX, chunkZ, generation, epoch)) {
+				return;
+			}
+			List<SectionFill> fills;
+			try {
+				fills = ENGINE.publish(snapshot, view, true, generation);
+			} catch (RuntimeException exception) {
+				Cavefill.LOGGER.error("Cave fill solver failed for chunk [{}, {}]", chunkX, chunkZ, exception);
+				ENGINE.discardColumn(chunkX, chunkZ);
+				return;
+			}
+			if (!current(chunkX, chunkZ, generation, epoch)) {
+				ENGINE.discardColumn(chunkX, chunkZ);
+				return;
+			}
+			if (fills.isEmpty()) {
+				return;
+			}
+			clientWork.add(() -> {
+				if (!current(chunkX, chunkZ, generation, epoch) || level == null) {
+					return;
+				}
+				deferred.addAll(fills);
+			});
+		});
+	}
+
+	private static void solveFresh(LevelChunk chunk, PlayerView view, int generation, int epoch) {
+		int chunkX = chunk.getPos().x();
+		int chunkZ = chunk.getPos().z();
+		if (!sameEpoch(epoch) || !sameGeneration(chunkX, chunkZ, generation)) {
+			if (sameGeneration(chunkX, chunkZ, generation) && chunk.getLevel() == Minecraft.getInstance().level) {
+				clientWork.add(() -> commitFresh(chunk, generation, epoch, List.of()));
+			}
+			return;
+		}
+		List<SectionFill> fills = List.of();
+		try {
+			fills = ENGINE.publish(ChunkSnapshot.capture(chunk), view, false, generation);
+			if (!current(chunkX, chunkZ, generation, epoch)) {
+				ENGINE.discardColumn(chunkX, chunkZ);
+			}
+		} catch (RuntimeException exception) {
+			Cavefill.LOGGER.error("Cave fill solver failed for chunk [{}, {}]", chunkX, chunkZ, exception);
+			ENGINE.discardColumn(chunkX, chunkZ);
+			fills = List.of();
+			if (!sameGeneration(chunkX, chunkZ, generation)) {
+				return;
+			}
+		}
+		List<SectionFill> handoff = fills;
+		clientWork.add(() -> commitFresh(chunk, generation, epoch, handoff));
+	}
+
+	private static void commitFresh(LevelChunk chunk, int generation, int epoch, List<SectionFill> fills) {
+		int chunkX = chunk.getPos().x();
+		int chunkZ = chunk.getPos().z();
+		if (!sameGeneration(chunkX, chunkZ, generation)) {
+			// Replaced or forgotten. Neighbor unfills still stand; this column must not be inserted.
+			if (sameEpoch(epoch) && level != null && chunk.getLevel() == minecraftLevel()) {
+				deferOthers(chunkX, chunkZ, fills);
+			}
+			ENGINE.enqueueUnload(chunkX, chunkZ, generation);
+			return;
+		}
+		Minecraft minecraft = Minecraft.getInstance();
+		boolean worldShowing = chunk.getLevel() == minecraft.level;
+		if (!sameEpoch(epoch) || !worldShowing || level == null) {
+			if (worldShowing) {
+				insertChunk(chunk);
+			}
+			ENGINE.enqueueUnload(chunkX, chunkZ, generation);
+			return;
+		}
+		if (!vacant(chunk)) {
+			deferOthers(chunkX, chunkZ, fills);
+			ENGINE.enqueueUnload(chunkX, chunkZ, generation);
+			return;
+		}
+		List<SectionFill> mine = new ArrayList<>();
+		for (SectionFill fill : fills) {
+			if (fill.sectionX == chunkX && fill.sectionZ == chunkZ) {
+				mine.add(fill);
+			}
+		}
+		deferOthers(chunkX, chunkZ, fills);
+		apply(mine, chunk);
+		if (!sameGeneration(chunkX, chunkZ, generation) || !sameEpoch(epoch) || chunk.getLevel() != minecraft.level) {
+			forgetColumn(chunkX, chunkZ);
+			if (chunk.getLevel() == minecraft.level && sameGeneration(chunkX, chunkZ, generation)) {
+				insertChunk(chunk);
+			}
+			ENGINE.enqueueUnload(chunkX, chunkZ, generation);
+			return;
+		}
+		if (!insertChunk(chunk)) {
+			forgetColumn(chunkX, chunkZ);
+			ENGINE.enqueueUnload(chunkX, chunkZ, generation);
+		}
+	}
+
+	/** Puts a filled chunk into the client cache and turns its light on. The server light packet may already have been stored. */
+	private static boolean insertChunk(LevelChunk chunk) {
+		if (!(chunk.getLevel() instanceof ClientLevel client) || client != Minecraft.getInstance().level) {
+			return false;
+		}
+		int chunkX = chunk.getPos().x();
+		int chunkZ = chunk.getPos().z();
+		ClientChunkStorageAccessor slots = storage(client);
+		if (!slots.cavefill$inRange(chunkX, chunkZ)) {
+			return false;
+		}
+		int index = slots.cavefill$getIndex(chunkX, chunkZ);
+		LevelChunk occupant = slots.cavefill$chunks().get(index);
+		if (occupant != null) {
+			Cavefill.LOGGER.warn("Skipped inserting cave-culled chunk [{}, {}] because that slot is already occupied", chunkX, chunkZ);
+			return false;
+		}
+		slots.cavefill$replace(index, chunk);
+		client.onChunkLoaded(new ChunkPos(chunkX, chunkZ));
+		enableChunkLight(client, chunk);
+		return true;
+	}
+
+	private static void enableChunkLight(ClientLevel client, LevelChunk chunk) {
+		var lightEngine = client.getChunkSource().getLightEngine();
+		LevelChunkSection[] sections = chunk.getSections();
+		ChunkPos chunkPos = chunk.getPos();
+		for (int sectionIndex = 0; sectionIndex < sections.length; sectionIndex++) {
+			LevelChunkSection section = sections[sectionIndex];
+			int sectionY = client.getSectionYFromSectionIndex(sectionIndex);
+			lightEngine.updateSectionStatus(SectionPos.of(chunkPos, sectionY), section.hasOnlyAir());
+		}
+		int chunkX = chunkPos.x();
+		int chunkZ = chunkPos.z();
+		client.setSectionRangeDirty(chunkX - 1, client.getMinSectionY(), chunkZ - 1, chunkX + 1, client.getMaxSectionY(), chunkZ + 1);
+	}
+
+	private static boolean vacant(LevelChunk chunk) {
+		if (!(chunk.getLevel() instanceof ClientLevel client)) {
+			return false;
+		}
+		int chunkX = chunk.getPos().x();
+		int chunkZ = chunk.getPos().z();
+		ClientChunkStorageAccessor slots = storage(client);
+		if (!slots.cavefill$inRange(chunkX, chunkZ)) {
+			return false;
+		}
+		return slots.cavefill$chunks().get(slots.cavefill$getIndex(chunkX, chunkZ)) == null;
+	}
+
+	private static ClientChunkStorageAccessor storage(ClientLevel client) {
+		Object slots = ((ClientChunkCacheAccessor) client.getChunkSource()).cavefill$storage();
+		return (ClientChunkStorageAccessor) slots;
+	}
+
+	private static void pump() {
+		Runnable task;
+		while ((task = clientWork.poll()) != null) {
+			try {
+				task.run();
+			} catch (RuntimeException exception) {
+				Cavefill.LOGGER.error("Cave fill client handoff failed", exception);
+			}
+		}
+		deferred.addAll(ENGINE.pollReady());
+	}
+
+	private static void deferOthers(int chunkX, int chunkZ, List<SectionFill> fills) {
+		for (SectionFill fill : fills) {
+			if (fill.sectionX != chunkX || fill.sectionZ != chunkZ) {
+				deferred.add(fill);
+			}
+		}
+	}
+
+	/** Pockets already sealed in this column, copied so a packet replace can put them back before the solver runs. */
+	private static List<SectionFill> pocketFills(int chunkX, int chunkZ) {
+		List<SectionFill> fills = new ArrayList<>();
+		for (var entry : applied.long2ObjectEntrySet()) {
+			long key = entry.getLongKey();
+			if (SectionPos.x(key) != chunkX || SectionPos.z(key) != chunkZ || entry.getValue().isEmpty()) {
+				continue;
+			}
+			fills.add(new SectionFill(key, chunkX, SectionPos.y(key), chunkZ, (BitSet) entry.getValue().clone()));
+		}
+		return fills;
+	}
+
+	private static Level minecraftLevel() {
+		return Minecraft.getInstance().level;
+	}
+
+	private static int bump(int chunkX, int chunkZ) {
+		return generations.merge(chunkKey(chunkX, chunkZ), 1, Integer::sum);
+	}
+
+	private static boolean current(int chunkX, int chunkZ, int generation, int epoch) {
+		return sameEpoch(epoch) && sameGeneration(chunkX, chunkZ, generation);
+	}
+
+	private static boolean sameEpoch(int epoch) {
+		return epoch == worldEpoch.get();
+	}
+
+	private static boolean sameGeneration(int chunkX, int chunkZ, int generation) {
+		return generations.getOrDefault(chunkKey(chunkX, chunkZ), 0) == generation;
 	}
 
 	private static PlayerView playerView() {
