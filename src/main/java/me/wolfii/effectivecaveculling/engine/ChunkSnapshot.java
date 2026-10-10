@@ -62,7 +62,7 @@ public final class ChunkSnapshot {
 			if ((sy << 4) >= maxOpen) {
 				continue;
 			}
-			BitSets masks = readSection(raw[i]);
+			BitSets masks = readSection(raw[i], sy << 4, firstOpenY);
 			long key = SectionPos.asLong(chunkX, sy, chunkZ);
 			kept[written++] = new SectionSnapshot(key, chunkX, sy, chunkZ, masks.passable, masks.sky);
 		}
@@ -120,18 +120,28 @@ public final class ChunkSnapshot {
 		}
 	}
 
-	private static BitSets readSection(LevelChunkSection section) {
+	private static BitSets readSection(LevelChunkSection section, int originY, int[] firstOpen) {
 		BitSet passable = new BitSet(Grid.VOLUME);
 		if (section.hasOnlyAir()) {
 			passable.set(0, Grid.VOLUME);
+			return new BitSets(passable, new BitSet(Grid.VOLUME));
+		}
+		// Solid sections have no passable palette entry. Skip the 4096-block walk.
+		if (!section.maybeHas(state -> !Cavefill.occludes(state))) {
 			return new BitSets(passable, new BitSet(Grid.VOLUME));
 		}
 
 		section.acquire();
 		try {
 			for (int y = 0; y < 16; y++) {
+				int worldY = originY + y;
 				for (int z = 0; z < 16; z++) {
 					for (int x = 0; x < 16; x++) {
+						int column = x | (z << 4);
+						if (firstOpen != null && worldY >= firstOpen[column]) {
+							passable.set(Grid.index(x, y, z));
+							continue;
+						}
 						if (!Cavefill.occludes(section.getBlockState(x, y, z))) {
 							passable.set(Grid.index(x, y, z));
 						}

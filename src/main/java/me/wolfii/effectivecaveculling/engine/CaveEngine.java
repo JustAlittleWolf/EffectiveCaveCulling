@@ -21,10 +21,12 @@ import net.minecraft.core.SectionPos;
 import net.minecraft.world.level.ChunkPos;
 
 /**
- * Incremental reachability for loaded chunks. Runs only on its own thread.
- * Unloaded sections and the volume outside the inclusive build height are solid.
- * Sections entirely above the surface heightmap are open sky, not solid and not scanned.
- * A pocket is isolated when no face-connected path of non-occluding blocks reaches the player or the open sky.
+ * Cached air volumes for loaded chunks. Each connected non-solid component stores its block count,
+ * whether it is open, and which chunk columns it still touches that are not loaded.
+ * A new chunk looks those roots up across its faces. It does not rescan the world.
+ * Volumes outside the build height are solid, except the top while the player is above the world
+ * and the bottom while the player is below it.
+ * Chunks that have already been published only lose fills.
  */
 public final class CaveEngine {
 	private final ExecutorService worker = Executors.newSingleThreadExecutor(runnable -> {
@@ -32,30 +34,36 @@ public final class CaveEngine {
 		thread.setDaemon(true);
 		return thread;
 	});
+	private static final long[] NO_PENDING = new long[0];
+
 	private final ConcurrentLinkedQueue<SectionFill> pending = new ConcurrentLinkedQueue<>();
 	private final ConcurrentLinkedQueue<BlockEdit> blockEdits = new ConcurrentLinkedQueue<>();
+	private final ConcurrentLinkedQueue<Vertical> vertical = new ConcurrentLinkedQueue<>();
 	private Future<?> async;
 
 	private final Long2ObjectOpenHashMap<SectionSnapshot> snapshots = new Long2ObjectOpenHashMap<>();
+	/** Section keys in one chunk column, so a drop does not scan every loaded section. */
+	private final Long2ObjectOpenHashMap<LongArrayList> sectionKeys = new Long2ObjectOpenHashMap<>();
 	/** Chunk columns already indexed. Republishing one replaces its sections instead of merging. */
 	private final LongOpenHashSet columns = new LongOpenHashSet();
 	/** First open-air Y per column of a loaded chunk. Missing sections at or above this are sky, not solid. */
 	private final Long2ObjectOpenHashMap<int[]> ceilings = new Long2ObjectOpenHashMap<>();
 	private final Long2ObjectOpenHashMap<SectionModel> models = new Long2ObjectOpenHashMap<>();
-	/** Passable blocks already decided to stay real. Later solves never fill these, and never fill anything new in that section. */
-	private final Long2ObjectOpenHashMap<BitSet> anchors = new Long2ObjectOpenHashMap<>();
 	private final LongOpenHashSet settled = new LongOpenHashSet();
 	private final Long2ObjectOpenHashMap<BitSet> lastEmitted = new Long2ObjectOpenHashMap<>();
 	private final LongOpenHashSet dirty = new LongOpenHashSet();
 	/** Sections whose live blocks diverged from the last fill and must be written again. */
 	private final LongOpenHashSet reemit = new LongOpenHashSet();
+	/** Root id to chunk columns that volume still touches which are not loaded. */
+	private final Int2ObjectOpenHashMap<LongOpenHashSet> pendingByRoot = new Int2ObjectOpenHashMap<>();
+	/** Chunk column to the volume roots waiting on it. */
+	private final Long2ObjectOpenHashMap<IntOpenHashSet> pendingRoots = new Long2ObjectOpenHashMap<>();
 
 	private final ArrayList<Comp> comps = new ArrayList<>();
 	private final Int2ObjectOpenHashMap<IntArrayList> compsByRoot = new Int2ObjectOpenHashMap<>();
 	/** Roots the player can walk to, or that are open sky / an exempt cavern. Passable blocks outside these are filled. */
 	private final IntOpenHashSet open = new IntOpenHashSet();
 	private final Int2IntOpenHashMap sizeByRoot = new Int2IntOpenHashMap();
-	private final IntOpenHashSet unloadedRoots = new IntOpenHashSet();
 	private int[] parent = new int[1024];
 	private Comp[] byId = new Comp[1024];
 	private int nextId = 1;
@@ -63,12 +71,22 @@ public final class CaveEngine {
 	private int minY = Integer.MIN_VALUE;
 	private int maxY = Integer.MAX_VALUE;
 	private boolean hasSkyLight = true;
-	private boolean needsRebuild;
-	private PlayerView player = new PlayerView(new int[] {0, 64, 0});
+	private boolean playerAbove;
+	private boolean playerBelow;
+	private PlayerView player = new PlayerView(new int[] {0, 64, 0}, false, false);
+	/** Client thread only. Skips duplicate vertical hints. */
+	private boolean clientSawVertical;
+	private boolean clientAbove;
+	private boolean clientBelow;
 
 	public void publishAndWait(ChunkSnapshot chunk, PlayerView view) {
+		this.publishAndWait(chunk, view, false);
+	}
+
+	/** {@code alreadyInWorld} indexes a chunk that other mods have already seen, and does not add fills. */
+	public void publishAndWait(ChunkSnapshot chunk, PlayerView view, boolean alreadyInWorld) {
 		this.finishFlush();
-		this.join(this.worker.submit(() -> this.publish0(chunk, view)));
+		this.join(this.worker.submit(() -> this.publish0(chunk, view, alreadyInWorld)));
 	}
 
 	public void flushAndWait(PlayerView view) {
@@ -85,15 +103,28 @@ public final class CaveEngine {
 		this.blockEdits.add(new BlockEdit(x, y, z, passable, true));
 	}
 
-	/** No queued edits and no flush in flight. View moves can skip the client-thread wait. */
-	public boolean idle() {
-		return this.blockEdits.isEmpty() && (this.async == null || this.async.isDone());
+	/**
+	 * The top of the world is open while {@code above} is set, and the bottom while {@code below} is set.
+	 * Returns whether this changed the queued state. Call from the client thread only.
+	 */
+	public boolean enqueueVertical(boolean above, boolean below) {
+		if (this.clientSawVertical && above == this.clientAbove && below == this.clientBelow) {
+			return false;
+		}
+		this.clientSawVertical = true;
+		this.clientAbove = above;
+		this.clientBelow = below;
+		this.vertical.add(new Vertical(above, below));
+		return true;
 	}
 
-	/** Queue the fills already decided, so leaving spectator can seal again without a new search. */
-	public void replayAndWait() {
-		this.finishFlush();
-		this.join(this.worker.submit(this::replay0));
+	public void clearClientVertical() {
+		this.clientSawVertical = false;
+	}
+
+	/** No queued edits and no flush in flight. View moves can skip the client-thread wait. */
+	public boolean idle() {
+		return this.blockEdits.isEmpty() && this.vertical.isEmpty() && (this.async == null || this.async.isDone());
 	}
 
 	/** Start a background catch-up if one is not already running. */
@@ -147,43 +178,72 @@ public final class CaveEngine {
 		}
 	}
 
-	private void publish0(ChunkSnapshot chunk, PlayerView view) {
+	private void publish0(ChunkSnapshot chunk, PlayerView view, boolean alreadyInWorld) {
 		this.player = view;
 		this.minY = chunk.minY;
 		this.maxY = chunk.maxY;
 		this.hasSkyLight = chunk.hasSkyLight;
+		this.applyVertical();
+		this.applyOutside(view.above, view.below);
 		this.applyQueuedEdits();
 
 		long column = ChunkPos.pack(chunk.chunkX, chunk.chunkZ);
-		if (this.columns.contains(column)) {
+		boolean loaded = alreadyInWorld || this.columns.contains(column);
+		Long2ObjectOpenHashMap<BitSet> kept = loaded ? this.takeEmitted(column) : null;
+		if (loaded) {
 			this.dropChunk(chunk.chunkX, chunk.chunkZ);
-			this.needsRebuild = true;
 		}
 		this.columns.add(column);
 		if (chunk.firstOpenY != null) {
 			this.ceilings.put(column, chunk.firstOpenY);
 		}
+		LongArrayList keys = new LongArrayList(chunk.sections.length);
 		for (SectionSnapshot section : chunk.sections) {
 			this.snapshots.put(section.key, section);
+			keys.add(section.key);
 		}
+		this.sectionKeys.put(column, keys);
 
-		if (this.needsRebuild) {
-			this.rebuildAll();
-		} else {
-			this.integrateNewChunk(chunk);
-			this.seedPlayer();
-			this.exemptOpenCaverns(chunk);
+		this.integrateNewChunk(chunk);
+		this.seedPlayer();
+		this.resolvePending(column);
+		this.exemptOpenCaverns(chunk);
+		if (loaded) {
+			// Already published once. Re-seal only pockets that were already filled.
+			for (SectionSnapshot section : chunk.sections) {
+				this.settled.add(section.key);
+			}
+			if (kept != null) {
+				for (var entry : kept.long2ObjectEntrySet()) {
+					this.lastEmitted.put(entry.getLongKey(), entry.getValue());
+				}
+			}
 		}
 		this.emit();
 	}
 
 	private void flush0(PlayerView view) {
 		this.player = view;
+		this.applyVertical();
+		this.applyOutside(view.above, view.below);
 		this.applyQueuedEdits();
-		if (this.needsRebuild) {
-			this.rebuildAll();
-		}
 		this.emit();
+	}
+
+	private Long2ObjectOpenHashMap<BitSet> takeEmitted(long column) {
+		Long2ObjectOpenHashMap<BitSet> kept = new Long2ObjectOpenHashMap<>();
+		LongArrayList keys = this.sectionKeys.get(column);
+		if (keys == null) {
+			return kept;
+		}
+		for (int i = 0; i < keys.size(); i++) {
+			long key = keys.getLong(i);
+			BitSet fill = this.lastEmitted.get(key);
+			if (fill != null && !fill.isEmpty()) {
+				kept.put(key, fill);
+			}
+		}
+		return kept;
 	}
 
 	private void applyQueuedEdits() {
@@ -212,43 +272,23 @@ public final class CaveEngine {
 		}
 		BitSet passable = (BitSet) section.passable.clone();
 		passable.set(local, edit.passable);
-		int cx = section.sx;
-		int cz = section.sz;
-		LongArrayList keys = new LongArrayList();
-		for (SectionSnapshot existing : this.snapshots.values()) {
-			if (existing.sx == cx && existing.sz == cz) {
-				keys.add(existing.key);
-			}
-		}
-		SectionSnapshot[] column = new SectionSnapshot[keys.size()];
-		for (int i = 0; i < keys.size(); i++) {
-			SectionSnapshot existing = this.snapshots.get(keys.getLong(i));
-			BitSet nextPassable = existing.key == key ? passable : existing.passable;
-			BitSet sky = new BitSet(Grid.VOLUME);
-			column[i] = new SectionSnapshot(existing.key, existing.sx, existing.sy, existing.sz, nextPassable, sky);
-		}
-		ChunkSnapshot.repaintSky(column, this.hasSkyLight);
-		for (SectionSnapshot updated : column) {
-			this.snapshots.put(updated.key, updated);
-		}
-		this.needsRebuild = true;
+		this.snapshots.put(key, section.withPassable(passable, section.sky));
+		this.refreshSky(section.sx, section.sz);
+		this.rebuildSection(key);
 	}
 
 	private void dropChunk(int chunkX, int chunkZ) {
 		long column = ChunkPos.pack(chunkX, chunkZ);
 		this.columns.remove(column);
 		this.ceilings.remove(column);
-		LongArrayList remove = new LongArrayList();
-		for (SectionSnapshot section : this.snapshots.values()) {
-			if (section.sx == chunkX && section.sz == chunkZ) {
-				remove.add(section.key);
-			}
+		LongArrayList keys = this.sectionKeys.remove(column);
+		if (keys == null) {
+			return;
 		}
-		for (int i = 0; i < remove.size(); i++) {
-			long key = remove.getLong(i);
+		for (int i = 0; i < keys.size(); i++) {
+			long key = keys.getLong(i);
+			this.retire(this.models.remove(key));
 			this.snapshots.remove(key);
-			this.models.remove(key);
-			this.anchors.remove(key);
 			this.settled.remove(key);
 			this.lastEmitted.remove(key);
 			this.dirty.remove(key);
@@ -264,72 +304,108 @@ public final class CaveEngine {
 
 	private void reset0() {
 		this.snapshots.clear();
+		this.sectionKeys.clear();
 		this.columns.clear();
 		this.ceilings.clear();
 		this.models.clear();
-		this.anchors.clear();
 		this.settled.clear();
 		this.lastEmitted.clear();
 		this.dirty.clear();
 		this.reemit.clear();
+		this.pendingByRoot.clear();
+		this.pendingRoots.clear();
 		this.comps.clear();
 		this.compsByRoot.clear();
 		this.open.clear();
 		this.sizeByRoot.clear();
-		this.unloadedRoots.clear();
 		this.parent = new int[1024];
 		this.byId = new Comp[1024];
 		this.nextId = 1;
-		this.needsRebuild = false;
+		this.playerAbove = false;
+		this.playerBelow = false;
 		this.pending.clear();
 		this.blockEdits.clear();
+		this.vertical.clear();
 	}
 
-	private void rebuildAll() {
-		this.needsRebuild = false;
-		this.models.clear();
-		this.comps.clear();
-		this.compsByRoot.clear();
-		this.open.clear();
-		this.sizeByRoot.clear();
-		this.unloadedRoots.clear();
-		this.parent = new int[Math.max(1024, this.snapshots.size() * 4)];
-		this.byId = new Comp[this.parent.length];
-		this.nextId = 1;
+	private void applyVertical() {
+		Vertical last = null;
+		Vertical next;
+		while ((next = this.vertical.poll()) != null) {
+			last = next;
+		}
+		if (last != null) {
+			this.applyOutside(last.above, last.below);
+		}
+	}
 
-		for (SectionSnapshot snapshot : this.snapshots.values()) {
-			SectionModel model = this.buildModel(snapshot);
-			this.models.put(snapshot.key, model);
-			for (Comp comp : model.comps) {
-				this.register(comp);
-				this.dirty.add(snapshot.key);
+	private void applyOutside(boolean above, boolean below) {
+		boolean openTop = above && !this.playerAbove;
+		boolean openBottom = below && !this.playerBelow;
+		this.playerAbove = above;
+		this.playerBelow = below;
+		if (openTop) {
+			this.openBorder(true);
+		}
+		if (openBottom) {
+			this.openBorder(false);
+		}
+	}
+
+	/** Volumes that touch the void the player just entered become open. Already loaded chunks only lose fills. */
+	private void openBorder(boolean above) {
+		for (Comp comp : this.comps) {
+			if (comp.dead) {
+				continue;
 			}
-			if (model.comps.length == 0) {
-				this.dirty.add(snapshot.key);
+			if (above ? comp.bordersAbove : comp.bordersBelow) {
+				this.markOpen(comp);
 			}
 		}
-		for (SectionModel model : this.models.values()) {
-			this.linkPositiveFaces(model);
-		}
-		this.seedSky();
-		this.seedPlayer();
-		this.seedAnchors();
-		this.exemptAllOpenCaverns();
 	}
 
 	private void integrateNewChunk(ChunkSnapshot chunk) {
 		for (SectionSnapshot snapshot : chunk.sections) {
-			SectionModel model = this.buildModel(snapshot);
-			this.models.put(snapshot.key, model);
-			this.dirty.add(snapshot.key);
-			for (Comp comp : model.comps) {
-				this.register(comp);
-				if (comp.sky) {
-					this.markOpen(comp);
-				}
+			this.rebuildSection(snapshot.key);
+		}
+	}
+
+	/** Replace one section's components and union them with the cached neighbor volumes. */
+	private void rebuildSection(long key) {
+		SectionSnapshot snapshot = this.snapshots.get(key);
+		if (snapshot == null) {
+			return;
+		}
+		this.retire(this.models.remove(key));
+		SectionModel model = this.buildModel(snapshot);
+		this.models.put(key, model);
+		this.dirty.add(key);
+		for (Comp comp : model.comps) {
+			this.register(comp);
+			if (comp.sky || comp.exterior) {
+				this.markOpen(comp);
 			}
-			this.linkPositiveFaces(model);
-			this.linkIncomingFaces(model);
+		}
+		this.linkPositiveFaces(model);
+		this.linkIncomingFaces(model);
+	}
+
+	private void retire(SectionModel model) {
+		if (model == null) {
+			return;
+		}
+		for (Comp comp : model.comps) {
+			if (comp.dead) {
+				continue;
+			}
+			comp.dead = true;
+			int root = this.find(comp.id);
+			int left = this.sizeByRoot.get(root) - comp.size;
+			if (left > 0) {
+				this.sizeByRoot.put(root, left);
+			} else {
+				this.sizeByRoot.remove(root);
+			}
 		}
 	}
 
@@ -343,8 +419,36 @@ public final class CaveEngine {
 		members.add(index);
 		this.compsByRoot.put(id, members);
 		this.sizeByRoot.put(id, comp.size);
-		if (comp.touchesUnloaded) {
-			this.unloadedRoots.add(id);
+		for (long column : comp.pending) {
+			this.watchPending(id, column);
+		}
+	}
+
+	private void watchPending(int root, long column) {
+		IntOpenHashSet roots = this.pendingRoots.get(column);
+		if (roots == null) {
+			roots = new IntOpenHashSet();
+			this.pendingRoots.put(column, roots);
+		}
+		roots.add(root);
+		LongOpenHashSet columns = this.pendingByRoot.get(root);
+		if (columns == null) {
+			columns = new LongOpenHashSet();
+			this.pendingByRoot.put(root, columns);
+		}
+		columns.add(column);
+	}
+
+	private void resolvePending(long column) {
+		IntOpenHashSet roots = this.pendingRoots.remove(column);
+		if (roots == null) {
+			return;
+		}
+		for (int root : roots) {
+			LongOpenHashSet columns = this.pendingByRoot.get(this.find(root));
+			if (columns != null) {
+				columns.remove(column);
+			}
 		}
 	}
 
@@ -420,42 +524,11 @@ public final class CaveEngine {
 		return Grid.index(x, y, z);
 	}
 
-	private void seedSky() {
-		for (Comp comp : this.comps) {
-			if (comp.sky && !comp.dead) {
-				this.markOpen(comp);
-			}
-		}
-	}
-
 	private void seedPlayer() {
 		int[] body = this.player.body;
 		for (int i = 0; i + 2 < body.length; i += 3) {
 			Comp comp = this.compAt(body[i], body[i + 1], body[i + 2]);
 			if (comp != null) {
-				this.markOpen(comp);
-			}
-		}
-	}
-
-	/** Blocks that were left real stay reachable, so a later edit can open a filled pocket but cannot fill a new one. */
-	private void seedAnchors() {
-		IntOpenHashSet seeded = new IntOpenHashSet();
-		for (var entry : this.anchors.long2ObjectEntrySet()) {
-			SectionModel model = this.models.get(entry.getLongKey());
-			if (model == null) {
-				continue;
-			}
-			BitSet anchor = entry.getValue();
-			for (int index = anchor.nextSetBit(0); index >= 0; index = anchor.nextSetBit(index + 1)) {
-				Comp comp = model.compAt(index);
-				if (comp == null || comp.dead) {
-					continue;
-				}
-				int root = this.find(comp.id);
-				if (!seeded.add(root)) {
-					continue;
-				}
 				this.markOpen(comp);
 			}
 		}
@@ -476,23 +549,9 @@ public final class CaveEngine {
 		}
 	}
 
-	private void exemptAllOpenCaverns() {
-		if (this.hasSkyLight) {
-			return;
-		}
-		IntOpenHashSet seen = new IntOpenHashSet();
-		for (Comp comp : this.comps) {
-			if (!comp.dead) {
-				seen.add(this.find(comp.id));
-			}
-		}
-		for (int root : seen) {
-			this.exemptRoot(root);
-		}
-	}
-
 	private void exemptRoot(int root) {
-		if (!this.unloadedRoots.contains(root)) {
+		LongOpenHashSet columns = this.pendingByRoot.get(root);
+		if (columns == null || columns.isEmpty()) {
 			return;
 		}
 		if (this.sizeByRoot.get(root) < Cavefill.OPEN_CAVERN_BLOCKS) {
@@ -549,6 +608,26 @@ public final class CaveEngine {
 		}
 	}
 
+	private void mergePending(int ra, int rb) {
+		LongOpenHashSet moved = this.pendingByRoot.remove(rb);
+		if (moved == null) {
+			return;
+		}
+		for (long column : moved) {
+			IntOpenHashSet roots = this.pendingRoots.get(column);
+			if (roots != null) {
+				roots.remove(rb);
+				roots.add(ra);
+			}
+		}
+		LongOpenHashSet dest = this.pendingByRoot.get(ra);
+		if (dest == null) {
+			this.pendingByRoot.put(ra, moved);
+		} else {
+			dest.addAll(moved);
+		}
+	}
+
 	private void union(Comp left, Comp right) {
 		if (left == null || right == null || left == right) {
 			return;
@@ -561,9 +640,7 @@ public final class CaveEngine {
 		this.parent[rb] = ra;
 		this.sizeByRoot.put(ra, this.sizeByRoot.get(ra) + this.sizeByRoot.get(rb));
 		this.sizeByRoot.remove(rb);
-		if (this.unloadedRoots.remove(rb)) {
-			this.unloadedRoots.add(ra);
-		}
+		this.mergePending(ra, rb);
 		IntArrayList membersA = this.compsByRoot.get(ra);
 		IntArrayList membersB = this.compsByRoot.get(rb);
 		if (membersA == null) {
@@ -642,7 +719,7 @@ public final class CaveEngine {
 			IntArrayList boundary = new IntArrayList();
 			int size = 0;
 			boolean sky = false;
-			boolean unloaded = false;
+			Border border = new Border();
 			local[start] = id;
 			queue.add(start);
 			while (!queue.isEmpty()) {
@@ -660,14 +737,8 @@ public final class CaveEngine {
 					int ny = y + Grid.DY[direction];
 					int nz = z + Grid.DZ[direction];
 					if (nx < 0 || ny < 0 || nz < 0 || nx > 15 || ny > 15 || nz > 15) {
-						int wx = snapshot.originX + nx;
-						int wy = snapshot.originY + ny;
-						int wz = snapshot.originZ + nz;
-						if (!this.passableWorld(wx, wy, wz)) {
+						if (border.blocked(this, snapshot.originX + nx, snapshot.originY + ny, snapshot.originZ + nz)) {
 							edge = true;
-							if (wy >= this.minY && wy <= this.maxY && this.snapshotAt(wx, wy, wz) == null) {
-								unloaded = true;
-							}
 						}
 						continue;
 					}
@@ -683,15 +754,15 @@ public final class CaveEngine {
 					boundary.add(index);
 				}
 			}
-			built.add(this.track(new Comp(this.allocateId(), snapshot.key, snapshot.originX, snapshot.originY, snapshot.originZ, boundary.toIntArray(), size, sky, unloaded)));
+			built.add(this.track(this.component(snapshot, boundary.toIntArray(), size, sky, border)));
 		}
 		return new SectionModel(snapshot, built.toArray(Comp[]::new), local);
 	}
 
 	private Comp makeUniform(SectionSnapshot snapshot) {
 		IntArrayList boundary = new IntArrayList();
-		boolean unloaded = false;
 		boolean sky = snapshot.sky.cardinality() > 0;
+		Border border = new Border();
 		for (int y = 0; y < 16; y++) {
 			for (int z = 0; z < 16; z++) {
 				for (int x = 0; x < 16; x++) {
@@ -700,29 +771,23 @@ public final class CaveEngine {
 						continue;
 					}
 					boolean solidNeighbor = false;
-					if (x == 0 && !this.passableWorld(snapshot.originX - 1, snapshot.originY + y, snapshot.originZ + z)) {
+					if (x == 0 && border.blocked(this, snapshot.originX - 1, snapshot.originY + y, snapshot.originZ + z)) {
 						solidNeighbor = true;
-						unloaded |= this.missingLoaded(snapshot.originX - 1, snapshot.originY + y, snapshot.originZ + z);
 					}
-					if (x == 15 && !this.passableWorld(snapshot.originX + 16, snapshot.originY + y, snapshot.originZ + z)) {
+					if (x == 15 && border.blocked(this, snapshot.originX + 16, snapshot.originY + y, snapshot.originZ + z)) {
 						solidNeighbor = true;
-						unloaded |= this.missingLoaded(snapshot.originX + 16, snapshot.originY + y, snapshot.originZ + z);
 					}
-					if (y == 0 && !this.passableWorld(snapshot.originX + x, snapshot.originY - 1, snapshot.originZ + z)) {
+					if (y == 0 && border.blocked(this, snapshot.originX + x, snapshot.originY - 1, snapshot.originZ + z)) {
 						solidNeighbor = true;
-						unloaded |= this.missingLoaded(snapshot.originX + x, snapshot.originY - 1, snapshot.originZ + z);
 					}
-					if (y == 15 && !this.passableWorld(snapshot.originX + x, snapshot.originY + 16, snapshot.originZ + z)) {
+					if (y == 15 && border.blocked(this, snapshot.originX + x, snapshot.originY + 16, snapshot.originZ + z)) {
 						solidNeighbor = true;
-						unloaded |= this.missingLoaded(snapshot.originX + x, snapshot.originY + 16, snapshot.originZ + z);
 					}
-					if (z == 0 && !this.passableWorld(snapshot.originX + x, snapshot.originY + y, snapshot.originZ - 1)) {
+					if (z == 0 && border.blocked(this, snapshot.originX + x, snapshot.originY + y, snapshot.originZ - 1)) {
 						solidNeighbor = true;
-						unloaded |= this.missingLoaded(snapshot.originX + x, snapshot.originY + y, snapshot.originZ - 1);
 					}
-					if (z == 15 && !this.passableWorld(snapshot.originX + x, snapshot.originY + y, snapshot.originZ + 16)) {
+					if (z == 15 && border.blocked(this, snapshot.originX + x, snapshot.originY + y, snapshot.originZ + 16)) {
 						solidNeighbor = true;
-						unloaded |= this.missingLoaded(snapshot.originX + x, snapshot.originY + y, snapshot.originZ + 16);
 					}
 					if (solidNeighbor) {
 						boundary.add(Grid.index(x, y, z));
@@ -730,7 +795,48 @@ public final class CaveEngine {
 				}
 			}
 		}
-		return this.track(new Comp(this.allocateId(), snapshot.key, snapshot.originX, snapshot.originY, snapshot.originZ, boundary.toIntArray(), Grid.VOLUME, sky, unloaded));
+		return this.track(this.component(snapshot, boundary.toIntArray(), Grid.VOLUME, sky, border));
+	}
+
+	private Comp component(SectionSnapshot snapshot, int[] boundary, int size, boolean sky, Border border) {
+		return new Comp(
+			this.allocateId(),
+			snapshot.key,
+			snapshot.originX,
+			snapshot.originY,
+			snapshot.originZ,
+			boundary,
+			size,
+			sky,
+			border.exterior,
+			border.above,
+			border.below,
+			border.columns()
+		);
+	}
+
+	private void refreshSky(int chunkX, int chunkZ) {
+		LongArrayList keys = this.sectionKeys.get(ChunkPos.pack(chunkX, chunkZ));
+		if (keys == null || keys.isEmpty()) {
+			return;
+		}
+		SectionSnapshot[] column = new SectionSnapshot[keys.size()];
+		for (int i = 0; i < keys.size(); i++) {
+			SectionSnapshot existing = this.snapshots.get(keys.getLong(i));
+			column[i] = new SectionSnapshot(existing.key, existing.sx, existing.sy, existing.sz, existing.passable, new BitSet(Grid.VOLUME));
+		}
+		ChunkSnapshot.repaintSky(column, this.hasSkyLight);
+		for (SectionSnapshot updated : column) {
+			this.snapshots.put(updated.key, updated);
+			SectionModel model = this.models.get(updated.key);
+			if (model == null) {
+				continue;
+			}
+			model.snapshot = updated;
+			for (int index = updated.sky.nextSetBit(0); index >= 0; index = updated.sky.nextSetBit(index + 1)) {
+				this.markOpen(model.compAt(index));
+			}
+		}
 	}
 
 	private boolean missingLoaded(int x, int y, int z) {
@@ -738,8 +844,11 @@ public final class CaveEngine {
 	}
 
 	private boolean passableWorld(int x, int y, int z) {
-		if (y < this.minY || y > this.maxY) {
-			return false;
+		if (y > this.maxY) {
+			return this.playerAbove;
+		}
+		if (y < this.minY) {
+			return this.playerBelow;
 		}
 		SectionSnapshot snapshot = this.snapshotAt(x, y, z);
 		if (snapshot != null) {
@@ -753,17 +862,6 @@ public final class CaveEngine {
 			return false;
 		}
 		return y >= ceiling[((z & 15) << 4) | (x & 15)];
-	}
-
-	private void replay0() {
-		for (var entry : this.lastEmitted.long2ObjectEntrySet()) {
-			SectionSnapshot snapshot = this.snapshots.get(entry.getLongKey());
-			BitSet fill = entry.getValue();
-			if (snapshot == null || fill.isEmpty()) {
-				continue;
-			}
-			this.pending.add(new SectionFill(snapshot.key, snapshot.sx, snapshot.sy, snapshot.sz, (BitSet) fill.clone()));
-		}
 	}
 
 	private SectionSnapshot snapshotAt(int x, int y, int z) {
@@ -815,7 +913,7 @@ public final class CaveEngine {
 					fill.and(previous);
 				}
 			}
-			this.rememberAnchors(snapshot, fill);
+			this.settled.add(snapshot.key);
 			if ((previous == null || previous.isEmpty()) && fill.isEmpty()) {
 				continue;
 			}
@@ -829,31 +927,6 @@ public final class CaveEngine {
 			}
 			this.pending.add(new SectionFill(key, snapshot.sx, snapshot.sy, snapshot.sz, fill));
 		}
-	}
-
-	private void rememberAnchors(SectionSnapshot snapshot, BitSet fill) {
-		SectionModel model = this.models.get(snapshot.key);
-		BitSet anchor = new BitSet(Grid.VOLUME);
-		if (model != null) {
-			for (int index = snapshot.passable.nextSetBit(0); index >= 0; index = snapshot.passable.nextSetBit(index + 1)) {
-				if (fill.get(index)) {
-					continue;
-				}
-				Comp comp = model.compAt(index);
-				if (comp == null) {
-					continue;
-				}
-				if (this.isOpen(comp.id)) {
-					anchor.set(index);
-				}
-			}
-		}
-		if (anchor.isEmpty()) {
-			this.anchors.remove(snapshot.key);
-		} else {
-			this.anchors.put(snapshot.key, anchor);
-		}
-		this.settled.add(snapshot.key);
 	}
 
 	private BitSet fillFor(SectionSnapshot snapshot) {
@@ -884,10 +957,28 @@ public final class CaveEngine {
 		final int[] boundary;
 		final int size;
 		final boolean sky;
-		final boolean touchesUnloaded;
+		/** Connected to the void outside the build height, which is open only while the player is out there. */
+		final boolean exterior;
+		final boolean bordersAbove;
+		final boolean bordersBelow;
+		/** Chunk columns on the other side of a face that are not loaded yet. */
+		final long[] pending;
 		boolean dead;
 
-		Comp(int id, long sectionKey, int originX, int originY, int originZ, int[] boundary, int size, boolean sky, boolean touchesUnloaded) {
+		Comp(
+			int id,
+			long sectionKey,
+			int originX,
+			int originY,
+			int originZ,
+			int[] boundary,
+			int size,
+			boolean sky,
+			boolean exterior,
+			boolean bordersAbove,
+			boolean bordersBelow,
+			long[] pending
+		) {
 			this.id = id;
 			this.sectionKey = sectionKey;
 			this.originX = originX;
@@ -896,12 +987,47 @@ public final class CaveEngine {
 			this.boundary = boundary;
 			this.size = size;
 			this.sky = sky;
-			this.touchesUnloaded = touchesUnloaded;
+			this.exterior = exterior;
+			this.bordersAbove = bordersAbove;
+			this.bordersBelow = bordersBelow;
+			this.pending = pending;
+		}
+	}
+
+	private static final class Border {
+		boolean above;
+		boolean below;
+		boolean exterior;
+		LongOpenHashSet pending;
+
+		boolean blocked(CaveEngine engine, int x, int y, int z) {
+			if (y > engine.maxY) {
+				this.above = true;
+			} else if (y < engine.minY) {
+				this.below = true;
+			}
+			if (!engine.passableWorld(x, y, z)) {
+				if (engine.missingLoaded(x, y, z)) {
+					if (this.pending == null) {
+						this.pending = new LongOpenHashSet();
+					}
+					this.pending.add(ChunkPos.pack(x >> 4, z >> 4));
+				}
+				return true;
+			}
+			if (y > engine.maxY || y < engine.minY) {
+				this.exterior = true;
+			}
+			return false;
+		}
+
+		long[] columns() {
+			return this.pending == null ? NO_PENDING : this.pending.toLongArray();
 		}
 	}
 
 	private static final class SectionModel {
-		final SectionSnapshot snapshot;
+		SectionSnapshot snapshot;
 		final Comp[] comps;
 		final short[] local;
 
@@ -927,5 +1053,8 @@ public final class CaveEngine {
 	}
 
 	private record BlockEdit(int x, int y, int z, boolean passable, boolean reveal) {
+	}
+
+	private record Vertical(boolean above, boolean below) {
 	}
 }
