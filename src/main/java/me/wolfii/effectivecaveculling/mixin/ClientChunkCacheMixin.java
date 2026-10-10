@@ -24,6 +24,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 public abstract class ClientChunkCacheMixin {
 	@Inject(
 		method = "replaceWithPacketData",
+		cancellable = true,
 		at = @At(
 			value = "INVOKE",
 			target = "Lnet/minecraft/world/level/chunk/LevelChunk;replaceWithPacketData(Lnet/minecraft/network/FriendlyByteBuf;Ljava/util/Map;Ljava/util/function/Consumer;)V",
@@ -39,13 +40,26 @@ public abstract class ClientChunkCacheMixin {
 		CallbackInfoReturnable<LevelChunk> callback,
 		@Local LevelChunk chunk
 	) {
-		if (chunk != null) {
-			CavefillController.beforeChunkPublished(chunk);
+		if (chunk == null) {
+			return;
 		}
+		ClientChunkCache cache = (ClientChunkCache) (Object) this;
+		Object storage = ((ClientChunkCacheAccessor) cache).cavefill$storage();
+		ClientChunkStorageAccessor slots = (ClientChunkStorageAccessor) storage;
+		LevelChunk current = slots.cavefill$chunks().get(slots.cavefill$getIndex(chunk.getPos().x(), chunk.getPos().z()));
+		if (current != chunk && CavefillController.deferFreshChunk(chunk)) {
+			// The packet thread is the render thread. Return before the cache publishes this chunk;
+			// the solver fills it and a client tick inserts it.
+			callback.setReturnValue(chunk);
+			callback.cancel();
+			return;
+		}
+		CavefillController.beforeChunkPublished(chunk);
 	}
 
 	@Inject(method = "drop", at = @At("HEAD"))
 	private void cavefill$beforeDrop(ChunkPos pos, CallbackInfo callback) {
+		CavefillController.invalidateChunk(pos.x(), pos.z());
 		CavefillController.beforeChunkSnapshotted();
 	}
 

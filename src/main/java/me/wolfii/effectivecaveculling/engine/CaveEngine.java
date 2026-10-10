@@ -5,6 +5,7 @@ import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
+import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
@@ -37,6 +38,8 @@ public final class CaveEngine {
 	private static final long[] NO_PENDING = new long[0];
 
 	private final ConcurrentLinkedQueue<SectionFill> pending = new ConcurrentLinkedQueue<>();
+	/** Fills drained on the solver thread and waiting for the client thread. The client thread never polls {@link #pending}. */
+	private final ConcurrentLinkedQueue<List<SectionFill>> ready = new ConcurrentLinkedQueue<>();
 	private final ConcurrentLinkedQueue<BlockEdit> blockEdits = new ConcurrentLinkedQueue<>();
 	private final ConcurrentLinkedQueue<Vertical> vertical = new ConcurrentLinkedQueue<>();
 	private Future<?> async;
@@ -46,6 +49,8 @@ public final class CaveEngine {
 	private final Long2ObjectOpenHashMap<LongArrayList> sectionKeys = new Long2ObjectOpenHashMap<>();
 	/** Chunk columns already indexed. Republishing one replaces its sections instead of merging. */
 	private final LongOpenHashSet columns = new LongOpenHashSet();
+	/** Generation that last integrated each column. Zero means the column has no recorded generation. */
+	private final Long2IntOpenHashMap integrated = new Long2IntOpenHashMap();
 	/** First open-air Y per column of a loaded chunk. Missing sections at or above this are sky, not solid. */
 	private final Long2ObjectOpenHashMap<int[]> ceilings = new Long2ObjectOpenHashMap<>();
 	private final Long2ObjectOpenHashMap<SectionModel> models = new Long2ObjectOpenHashMap<>();
@@ -79,19 +84,39 @@ public final class CaveEngine {
 	private boolean clientAbove;
 	private boolean clientBelow;
 
-	public void publishAndWait(ChunkSnapshot chunk, PlayerView view) {
-		this.publishAndWait(chunk, view, false);
+	/** Runs {@code task} on the solver thread. The task must not wait for this executor. */
+	public void execute(Runnable task) {
+		this.worker.execute(() -> {
+			try {
+				task.run();
+			} catch (Exception exception) {
+				Cavefill.LOGGER.error("Cave fill solver failed", exception);
+			}
+		});
 	}
 
-	/** {@code alreadyInWorld} indexes a chunk that other mods have already seen, and does not add fills. */
-	public void publishAndWait(ChunkSnapshot chunk, PlayerView view, boolean alreadyInWorld) {
-		this.finishFlush();
-		this.join(this.worker.submit(() -> this.publish0(chunk, view, alreadyInWorld)));
+	/**
+	 * Integrates a chunk on the solver thread and returns the fills that integration emitted.
+	 * {@code alreadyInWorld} indexes a chunk that other mods have already seen, and does not add fills.
+	 * A generation other than the one already stored for this column drops that column first, so the new chunk can be filled.
+	 */
+	public List<SectionFill> publish(ChunkSnapshot chunk, PlayerView view, boolean alreadyInWorld, int generation) {
+		RuntimeException failure = null;
+		try {
+			this.publish0(chunk, view, alreadyInWorld, generation);
+		} catch (RuntimeException exception) {
+			failure = exception;
+		}
+		List<SectionFill> fills = this.drain();
+		if (failure != null) {
+			throw failure;
+		}
+		return fills;
 	}
 
-	public void flushAndWait(PlayerView view) {
-		this.finishFlush();
-		this.join(this.worker.submit(() -> this.flush0(view)));
+	/** Drops a column immediately. Solver thread only. */
+	public void discardColumn(int chunkX, int chunkZ) {
+		this.dropChunk(chunkX, chunkZ);
 	}
 
 	public void enqueueBlock(int x, int y, int z, boolean passable) {
@@ -127,13 +152,20 @@ public final class CaveEngine {
 		return this.blockEdits.isEmpty() && this.vertical.isEmpty() && (this.async == null || this.async.isDone());
 	}
 
-	/** Start a background catch-up if one is not already running. */
+	/** Start a background catch-up if one is not already running. Fills are published through {@link #pollReady()}. */
 	public boolean startFlush(PlayerView view) {
 		if (this.async != null && !this.async.isDone()) {
 			return false;
 		}
-		this.async = null;
-		this.async = this.worker.submit(() -> this.flush0(view));
+		this.async = this.worker.submit(() -> {
+			try {
+				this.flush0(view);
+			} catch (Exception exception) {
+				Cavefill.LOGGER.error("Cave fill solver failed", exception);
+			} finally {
+				this.ready.add(this.drain());
+			}
+		});
 		return true;
 	}
 
@@ -154,7 +186,17 @@ public final class CaveEngine {
 		this.join(this.worker.submit(this::reset0));
 	}
 
-	public List<SectionFill> drain() {
+	/** Client thread. Fills the solver has already detached from the live queue. */
+	public List<SectionFill> pollReady() {
+		List<SectionFill> fills = new ArrayList<>();
+		List<SectionFill> batch;
+		while ((batch = this.ready.poll()) != null) {
+			fills.addAll(batch);
+		}
+		return fills;
+	}
+
+	private List<SectionFill> drain() {
 		List<SectionFill> fills = new ArrayList<>();
 		SectionFill fill;
 		while ((fill = this.pending.poll()) != null) {
@@ -178,7 +220,7 @@ public final class CaveEngine {
 		}
 	}
 
-	private void publish0(ChunkSnapshot chunk, PlayerView view, boolean alreadyInWorld) {
+	private void publish0(ChunkSnapshot chunk, PlayerView view, boolean alreadyInWorld, int generation) {
 		this.player = view;
 		this.minY = chunk.minY;
 		this.maxY = chunk.maxY;
@@ -188,6 +230,11 @@ public final class CaveEngine {
 		this.applyQueuedEdits();
 
 		long column = ChunkPos.pack(chunk.chunkX, chunk.chunkZ);
+		int previous = this.integrated.get(column);
+		// A newer copy of a chunk that was never published to the client replaces the old integration outright.
+		if (!alreadyInWorld && previous != 0 && previous != generation) {
+			this.dropChunk(chunk.chunkX, chunk.chunkZ);
+		}
 		boolean loaded = alreadyInWorld || this.columns.contains(column);
 		Long2ObjectOpenHashMap<BitSet> kept = loaded ? this.takeEmitted(column) : null;
 		if (loaded) {
@@ -218,6 +265,9 @@ public final class CaveEngine {
 					this.lastEmitted.put(entry.getLongKey(), entry.getValue());
 				}
 			}
+		}
+		if (generation != 0) {
+			this.integrated.put(column, generation);
 		}
 		this.emit();
 	}
@@ -280,6 +330,7 @@ public final class CaveEngine {
 	private void dropChunk(int chunkX, int chunkZ) {
 		long column = ChunkPos.pack(chunkX, chunkZ);
 		this.columns.remove(column);
+		this.integrated.remove(column);
 		this.ceilings.remove(column);
 		LongArrayList keys = this.sectionKeys.remove(column);
 		if (keys == null) {
@@ -302,10 +353,20 @@ public final class CaveEngine {
 		this.worker.execute(() -> this.dropChunk(chunkX, chunkZ));
 	}
 
+	/** Drops the column only if it is still the integration from {@code generation}, so a newer solve is left alone. */
+	public void enqueueUnload(int chunkX, int chunkZ, int generation) {
+		this.worker.execute(() -> {
+			if (this.integrated.get(ChunkPos.pack(chunkX, chunkZ)) == generation) {
+				this.dropChunk(chunkX, chunkZ);
+			}
+		});
+	}
+
 	private void reset0() {
 		this.snapshots.clear();
 		this.sectionKeys.clear();
 		this.columns.clear();
+		this.integrated.clear();
 		this.ceilings.clear();
 		this.models.clear();
 		this.settled.clear();
@@ -324,6 +385,7 @@ public final class CaveEngine {
 		this.playerAbove = false;
 		this.playerBelow = false;
 		this.pending.clear();
+		this.ready.clear();
 		this.blockEdits.clear();
 		this.vertical.clear();
 	}
