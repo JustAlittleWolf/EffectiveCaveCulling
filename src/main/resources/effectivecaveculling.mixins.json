@@ -1,0 +1,13 @@
+{
+	"required": true,
+	"package": "me.wolfii.effectivecaveculling.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"client": [
+		"ClientChunkCacheMixin",
+		"LevelChunkMixin",
+		"MultiPlayerGameModeMixin"
+	]
+}

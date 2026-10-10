@@ -1,0 +1,29 @@
+{
+	"schemaVersion": 1,
+	"id": "effectivecaveculling",
+	"version": "${version}",
+	"name": "Effective Cave Culling",
+	"description": "Client-side occlusion that fills isolated caves with red concrete before other mods read the chunk, and restores them when a later world change opens them.",
+	"authors": [
+		"JustAlittleWolf"
+	],
+	"contact": {
+		"issues": "https://github.com/JustAlittleWolf/EffectiveCaveCulling/issues/",
+		"sources": "https://github.com/JustAlittleWolf/EffectiveCaveCulling/"
+	},
+	"license": "MIT",
+	"environment": "client",
+	"entrypoints": {
+		"client": [
+			"me.wolfii.effectivecaveculling.CavefillClient"
+		]
+	},
+	"mixins": [
+		"effectivecaveculling.mixins.json"
+	],
+	"depends": {
+		"fabricloader": ">=0.19.5",
+		"minecraft": ">=${minecraft_version}",
+		"fabric-api": "*"
+	}
+}
