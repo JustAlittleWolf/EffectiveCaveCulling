@@ -23,7 +23,8 @@ import net.minecraft.core.SectionPos;
 
 /**
  * Incremental reachability for loaded chunks. Runs only on its own thread.
- * Unloaded sections are treated as solid, and the volume outside the build height is solid.
+ * Unloaded sections and the volume outside the inclusive build height are solid.
+ * A reached pocket may cross at most {@link Cavefill#SOLID_BUDGET} of those solids.
  */
 public final class CaveEngine {
 	private static final int UNSET = 127;
@@ -44,8 +45,6 @@ public final class CaveEngine {
 	private final LongOpenHashSet settled = new LongOpenHashSet();
 	private final Long2ObjectOpenHashMap<BitSet> lastEmitted = new Long2ObjectOpenHashMap<>();
 	private final LongOpenHashSet dirty = new LongOpenHashSet();
-	private final Long2ObjectOpenHashMap<byte[]> solidPlayer = new Long2ObjectOpenHashMap<>();
-	private final Long2ObjectOpenHashMap<byte[]> solidExterior = new Long2ObjectOpenHashMap<>();
 
 	private final ArrayList<Comp> comps = new ArrayList<>();
 	private final Int2ObjectOpenHashMap<IntArrayList> compsByRoot = new Int2ObjectOpenHashMap<>();
@@ -236,8 +235,6 @@ public final class CaveEngine {
 			this.anchors.remove(key);
 			this.settled.remove(key);
 			this.lastEmitted.remove(key);
-			this.solidPlayer.remove(key);
-			this.solidExterior.remove(key);
 			this.dirty.remove(key);
 		}
 	}
@@ -256,8 +253,6 @@ public final class CaveEngine {
 		this.settled.clear();
 		this.lastEmitted.clear();
 		this.dirty.clear();
-		this.solidPlayer.clear();
-		this.solidExterior.clear();
 		this.comps.clear();
 		this.compsByRoot.clear();
 		this.playerCost.clear();
@@ -282,8 +277,6 @@ public final class CaveEngine {
 		this.exteriorCost.clear();
 		this.sizeByRoot.clear();
 		this.unloadedRoots.clear();
-		this.solidPlayer.clear();
-		this.solidExterior.clear();
 		this.parent = new int[Math.max(1024, this.snapshots.size() * 4)];
 		this.byId = new Comp[this.parent.length];
 		this.nextId = 1;
@@ -325,6 +318,7 @@ public final class CaveEngine {
 			this.linkPositiveFaces(model);
 			this.linkIncomingFaces(model);
 		}
+		this.revisitLoadedNeighbors(chunk);
 	}
 
 	private void register(Comp comp) {
@@ -521,9 +515,8 @@ public final class CaveEngine {
 		}
 		int root = this.find(comp.id);
 		Int2ByteOpenHashMap costs = exterior ? this.exteriorCost : this.playerCost;
-		int previous = costs.get(root);
+		int previous = costs.get(root) & 0xFF;
 		if (cost >= previous) {
-			this.enqueueExpand(comp);
 			return;
 		}
 		costs.put(root, (byte) cost);
@@ -538,14 +531,27 @@ public final class CaveEngine {
 		for (int i = 0; i < members.size(); i++) {
 			Comp comp = this.comps.get(members.getInt(i));
 			if (!comp.dead && this.find(comp.id) == root) {
-				this.dirty.add(comp.sectionKey);
 				this.enqueueExpand(comp);
 			}
 		}
 	}
 
 	private void enqueueExpand(Comp comp) {
+		if (comp == null || comp.dead || comp.queued || !this.needsFlood(comp)) {
+			return;
+		}
+		comp.queued = true;
+		this.dirty.add(comp.sectionKey);
 		this.expandQueue.add(comp.id);
+	}
+
+	/** Already-expanded pieces are not queued again when a union copies a cost they already flooded. */
+	private boolean needsFlood(Comp comp) {
+		int root = this.find(comp.id);
+		int player = this.playerCost.get(root) & 0xFF;
+		int exterior = this.exteriorCost.get(root) & 0xFF;
+		return (player <= Cavefill.SOLID_BUDGET && comp.expandedPlayer > player)
+			|| (exterior <= Cavefill.SOLID_BUDGET && comp.expandedExterior > exterior);
 	}
 
 	private void drainExpand() {
@@ -554,13 +560,26 @@ public final class CaveEngine {
 			int id = this.expandQueue.poll();
 			Comp comp = this.compById(id);
 			if (comp == null || comp.dead) {
+				if (comp != null) {
+					comp.queued = false;
+				}
 				continue;
 			}
+			comp.queued = false;
 			this.expandOne(comp);
 			if (++guard > 1_000_000) {
 				Cavefill.LOGGER.warn("Cave fill expansion stopped early");
-				this.expandQueue.clear();
+				this.discardExpandQueue();
 				return;
+			}
+		}
+	}
+
+	private void discardExpandQueue() {
+		while (!this.expandQueue.isEmpty()) {
+			Comp comp = this.compById(this.expandQueue.poll());
+			if (comp != null) {
+				comp.queued = false;
 			}
 		}
 	}
@@ -574,8 +593,8 @@ public final class CaveEngine {
 
 	private void expandOne(Comp comp) {
 		int root = this.find(comp.id);
-		int player = this.playerCost.get(root);
-		int exterior = this.exteriorCost.get(root);
+		int player = this.playerCost.get(root) & 0xFF;
+		int exterior = this.exteriorCost.get(root) & 0xFF;
 		if (player <= Cavefill.SOLID_BUDGET && comp.expandedPlayer > player) {
 			comp.expandedPlayer = player;
 			this.flood(comp, player, false);
@@ -586,14 +605,20 @@ public final class CaveEngine {
 		}
 	}
 
+	/**
+	 * Walk solids out from a reached component. Air is seeded with the number of solids crossed,
+	 * so a wall of {@link Cavefill#SOLID_BUDGET} blocks still counts as reachable.
+	 * Outside the build height and missing sections are solid cells, not open space.
+	 */
 	private void flood(Comp source, int sourceCost, boolean exterior) {
+		Long2ObjectOpenHashMap<byte[]> visited = new Long2ObjectOpenHashMap<>();
 		ArrayDeque<Long> queue = new ArrayDeque<>();
 		for (int local : source.boundary) {
 			int x = source.originX + Grid.localX(local);
 			int y = source.originY + Grid.localY(local);
 			int z = source.originZ + Grid.localZ(local);
 			for (int direction = 0; direction < 6; direction++) {
-				this.consider(x + Grid.DX[direction], y + Grid.DY[direction], z + Grid.DZ[direction], sourceCost + 1, exterior, queue);
+				this.stepFromAir(x + Grid.DX[direction], y + Grid.DY[direction], z + Grid.DZ[direction], sourceCost, exterior, visited, queue);
 			}
 		}
 		while (!queue.isEmpty()) {
@@ -601,49 +626,68 @@ public final class CaveEngine {
 			int x = BlockPos.getX(packed);
 			int y = BlockPos.getY(packed);
 			int z = BlockPos.getZ(packed);
-			int cost = this.solidCost(x, y, z, exterior);
+			int crossed = this.solidEntryCost(visited, x, y, z);
 			for (int direction = 0; direction < 6; direction++) {
-				this.consider(x + Grid.DX[direction], y + Grid.DY[direction], z + Grid.DZ[direction], cost + 1, exterior, queue);
+				this.stepFromSolid(x + Grid.DX[direction], y + Grid.DY[direction], z + Grid.DZ[direction], crossed, exterior, visited, queue);
 			}
 		}
 	}
 
-	private void consider(int x, int y, int z, int cost, boolean exterior, ArrayDeque<Long> queue) {
-		if (cost > Cavefill.SOLID_BUDGET || y < this.minY || y > this.maxY) {
+	private void stepFromAir(int x, int y, int z, int sourceCost, boolean exterior, Long2ObjectOpenHashMap<byte[]> visited, ArrayDeque<Long> queue) {
+		if (this.passableLoaded(x, y, z)) {
+			this.seed(this.compAt(x, y, z), sourceCost, exterior);
+			return;
+		}
+		this.enterSolid(x, y, z, sourceCost + 1, visited, queue);
+	}
+
+	private void stepFromSolid(int x, int y, int z, int crossed, boolean exterior, Long2ObjectOpenHashMap<byte[]> visited, ArrayDeque<Long> queue) {
+		if (this.passableLoaded(x, y, z)) {
+			this.seed(this.compAt(x, y, z), crossed, exterior);
+			return;
+		}
+		this.enterSolid(x, y, z, crossed + 1, visited, queue);
+	}
+
+	/** @param entryCost solids crossed to stand on this solid cell, including the cell itself */
+	private void enterSolid(int x, int y, int z, int entryCost, Long2ObjectOpenHashMap<byte[]> visited, ArrayDeque<Long> queue) {
+		if (entryCost > Cavefill.SOLID_BUDGET) {
 			return;
 		}
 		long key = Grid.sectionKey(x, y, z);
-		SectionModel model = this.models.get(key);
-		if (model == null) {
-			return;
+		byte[] cells = visited.get(key);
+		if (cells == null) {
+			cells = new byte[Grid.VOLUME];
+			visited.put(key, cells);
 		}
 		int local = Grid.index(x & 15, y & 15, z & 15);
-		if (model.snapshot.passable.get(local)) {
-			this.seed(model.compAt(local), cost, exterior);
+		int previous = cells[local] & 0xFF;
+		if (previous != 0 && previous <= entryCost) {
 			return;
 		}
-		byte[] visited = this.solidVisited(key, exterior);
-		int previous = visited[local] & 0xFF;
-		if (previous != 0 && previous <= cost) {
-			return;
-		}
-		visited[local] = (byte) cost;
+		cells[local] = (byte) entryCost;
 		queue.add(Grid.block(x, y, z));
 	}
 
-	private int solidCost(int x, int y, int z, boolean exterior) {
-		byte[] visited = this.solidVisited(Grid.sectionKey(x, y, z), exterior);
-		return visited[Grid.index(x & 15, y & 15, z & 15)] & 0xFF;
+	private int solidEntryCost(Long2ObjectOpenHashMap<byte[]> visited, int x, int y, int z) {
+		byte[] cells = visited.get(Grid.sectionKey(x, y, z));
+		if (cells == null) {
+			return Cavefill.SOLID_BUDGET + 1;
+		}
+		int cost = cells[Grid.index(x & 15, y & 15, z & 15)] & 0xFF;
+		return cost == 0 ? Cavefill.SOLID_BUDGET + 1 : cost;
 	}
 
-	private byte[] solidVisited(long key, boolean exterior) {
-		Long2ObjectOpenHashMap<byte[]> map = exterior ? this.solidExterior : this.solidPlayer;
-		byte[] visited = map.get(key);
-		if (visited == null) {
-			visited = new byte[Grid.VOLUME];
-			map.put(key, visited);
+	/** Loaded non-solid block inside the build height. Everything else is solid. */
+	private boolean passableLoaded(int x, int y, int z) {
+		if (y < this.minY || y > this.maxY) {
+			return false;
 		}
-		return visited;
+		SectionModel model = this.models.get(Grid.sectionKey(x, y, z));
+		if (model == null) {
+			return false;
+		}
+		return model.snapshot.passable.get(Grid.index(x & 15, y & 15, z & 15));
 	}
 
 	private void union(Comp left, Comp right) {
@@ -671,9 +715,12 @@ public final class CaveEngine {
 			membersA.addAll(membersB);
 			this.compsByRoot.remove(rb);
 		}
-		int mergedPlayer = Math.min(this.playerCost.get(ra) & 0xFF, this.playerCost.get(rb) & 0xFF);
-		int mergedExterior = Math.min(this.exteriorCost.get(ra) & 0xFF, this.exteriorCost.get(rb) & 0xFF);
-		boolean improved = mergedPlayer < (this.playerCost.get(ra) & 0xFF) || mergedExterior < (this.exteriorCost.get(ra) & 0xFF);
+		int oldPlayerA = this.playerCost.get(ra) & 0xFF;
+		int oldPlayerB = this.playerCost.get(rb) & 0xFF;
+		int oldExteriorA = this.exteriorCost.get(ra) & 0xFF;
+		int oldExteriorB = this.exteriorCost.get(rb) & 0xFF;
+		int mergedPlayer = Math.min(oldPlayerA, oldPlayerB);
+		int mergedExterior = Math.min(oldExteriorA, oldExteriorB);
 		if (mergedPlayer < UNSET) {
 			this.playerCost.put(ra, (byte) mergedPlayer);
 		}
@@ -682,11 +729,10 @@ public final class CaveEngine {
 		}
 		this.playerCost.remove(rb);
 		this.exteriorCost.remove(rb);
-		if (improved) {
+		boolean spread = mergedPlayer < oldPlayerA || mergedPlayer < oldPlayerB
+			|| mergedExterior < oldExteriorA || mergedExterior < oldExteriorB;
+		if (spread) {
 			this.enqueueExpandRoot(ra);
-		} else {
-			this.enqueueExpand(left);
-			this.enqueueExpand(right);
 		}
 	}
 
@@ -823,6 +869,49 @@ public final class CaveEngine {
 			}
 		}
 		return this.track(new Comp(this.allocateId(), snapshot.key, snapshot.originX, snapshot.originY, snapshot.originZ, boundary.toIntArray(), Grid.VOLUME, sky, unloaded));
+	}
+
+	/**
+	 * A newly loaded column can sit one or two solids away from a cave that was already expanded.
+	 * Re-flood only the sections that share a face with it, not the whole connected cavern.
+	 */
+	private void revisitLoadedNeighbors(ChunkSnapshot chunk) {
+		for (SectionSnapshot section : chunk.sections) {
+			for (int direction = 0; direction < 6; direction++) {
+				int nsx = section.sx + Grid.DX[direction];
+				int nsy = section.sy + Grid.DY[direction];
+				int nsz = section.sz + Grid.DZ[direction];
+				if (nsx == chunk.chunkX && nsz == chunk.chunkZ) {
+					continue;
+				}
+				SectionModel neighbor = this.models.get(SectionPos.asLong(nsx, nsy, nsz));
+				if (neighbor == null) {
+					continue;
+				}
+				for (Comp comp : neighbor.comps) {
+					this.forceRevisit(comp);
+				}
+			}
+		}
+	}
+
+	private void forceRevisit(Comp comp) {
+		if (comp == null || comp.dead) {
+			return;
+		}
+		int root = this.find(comp.id);
+		int player = this.playerCost.get(root) & 0xFF;
+		int exterior = this.exteriorCost.get(root) & 0xFF;
+		if (player > Cavefill.SOLID_BUDGET && exterior > Cavefill.SOLID_BUDGET) {
+			return;
+		}
+		if (player <= Cavefill.SOLID_BUDGET) {
+			comp.expandedPlayer = UNSET;
+		}
+		if (exterior <= Cavefill.SOLID_BUDGET) {
+			comp.expandedExterior = UNSET;
+		}
+		this.enqueueExpand(comp);
 	}
 
 	private boolean missingLoaded(int x, int y, int z) {
@@ -966,6 +1055,7 @@ public final class CaveEngine {
 		final boolean sky;
 		final boolean touchesUnloaded;
 		boolean dead;
+		boolean queued;
 		int expandedPlayer = UNSET;
 		int expandedExterior = UNSET;
 
