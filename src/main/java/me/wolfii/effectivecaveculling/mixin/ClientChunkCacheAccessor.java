@@ -6,6 +6,10 @@ import org.spongepowered.asm.mixin.gen.Accessor;
 
 @Mixin(ClientChunkCache.class)
 public interface ClientChunkCacheAccessor {
+	/**
+	 * The field is {@code ClientChunkCache.Storage}, not {@code Object}.
+	 * Mixin matches the accessor descriptor exactly, so a wider return type does not apply.
+	 */
 	@Accessor("storage")
-	Object cavefill$storage();
+	ClientChunkCache.Storage cavefill$storage();
 }

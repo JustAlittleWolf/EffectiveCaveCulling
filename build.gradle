@@ -2,6 +2,10 @@ plugins {
     id 'net.fabricmc.fabric-loom' version "${loom_version}"
 }
 
+loom {
+    accessWidenerPath = file("src/main/resources/effectivecaveculling.accesswidener")
+}
+
 repositories {
     maven {
         name = 'Xander'

@@ -24,6 +24,7 @@
 	"mixins": [
 		"effectivecaveculling.mixins.json"
 	],
+	"accessWidener": "effectivecaveculling.accesswidener",
 	"depends": {
 		"fabricloader": ">=0.19.5",
 		"minecraft": ">=${minecraft_version}",
