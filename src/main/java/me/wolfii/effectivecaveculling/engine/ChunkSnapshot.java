@@ -24,6 +24,10 @@ public final class ChunkSnapshot {
 		this.sections = sections;
 	}
 
+	public static ChunkSnapshot create(int chunkX, int chunkZ, int minY, int maxY, boolean hasSkyLight, SectionSnapshot[] sections) {
+		return new ChunkSnapshot(chunkX, chunkZ, minY, maxY, hasSkyLight, sections);
+	}
+
 	public static ChunkSnapshot capture(LevelChunk chunk) {
 		boolean hasSkyLight = chunk.getLevel().dimensionType().hasSkyLight();
 		int minY = chunk.getMinY();
