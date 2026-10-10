@@ -1,0 +1,11 @@
+{
+	"effectivecaveculling.config.title": "Effective Cave Culling",
+	"effectivecaveculling.config.category.general": "General",
+	"effectivecaveculling.config.enabled": "Enabled",
+	"effectivecaveculling.config.enabled.description": "Master switch for sealing unreachable caves. Applies immediately, including while you are in a world.",
+	"effectivecaveculling.config.whitelist": "World whitelist",
+	"effectivecaveculling.config.whitelist.description": "The mod runs only in listed worlds, so it stays off everywhere until you add one. Singleplayer keys look like world/\"New World\". Server keys are the address, without a port on the default Minecraft port, and host:port otherwise.",
+	"effectivecaveculling.config.add_current": "Add current world",
+	"effectivecaveculling.config.add_current.description": "Adds the world or server you are currently in when it is not already in the whitelist.",
+	"effectivecaveculling.config.add_current.text": "Add"
+}

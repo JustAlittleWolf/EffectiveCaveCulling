@@ -2,6 +2,18 @@ plugins {
     id 'net.fabricmc.fabric-loom' version "${loom_version}"
 }
 
+repositories {
+    maven {
+        name = 'Xander'
+        url = 'https://maven.isxander.dev/releases'
+    }
+    maven {
+        name = 'Terraformers'
+        url = 'https://maven.terraformersmc.com/'
+    }
+    mavenCentral()
+}
+
 version = project.mod_version
 group = project.maven_group
 
@@ -13,6 +25,15 @@ dependencies {
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
     implementation "net.fabricmc:fabric-loader:${project.loader_version}"
     implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+    implementation "dev.isxander:yet-another-config-lib:${project.yacl_version}"
+    compileOnly "com.terraformersmc:modmenu:${project.modmenu_version}"
+
+    testImplementation "org.junit.jupiter:junit-jupiter:5.12.2"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+}
+
+test {
+    useJUnitPlatform()
 }
 
 processResources {

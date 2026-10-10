@@ -4,9 +4,13 @@ import me.wolfii.effectivecaveculling.engine.CaveEngine;
 import me.wolfii.effectivecaveculling.engine.ChunkSnapshot;
 import me.wolfii.effectivecaveculling.engine.PlayerView;
 import me.wolfii.effectivecaveculling.engine.SectionFill;
+import me.wolfii.effectivecaveculling.mixin.ClientChunkCacheAccessor;
+import me.wolfii.effectivecaveculling.mixin.ClientChunkStorageAccessor;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
@@ -37,6 +41,8 @@ public final class CavefillController {
 
 	private static ClientLevel level;
 	private static boolean solverDirty;
+	/** Chunks arrived while the mod was off, so enabling has to read what is already loaded. */
+	private static boolean catchUp;
 
 	private CavefillController() {
 	}
@@ -50,7 +56,14 @@ public final class CavefillController {
 	 * have not ingested it.
 	 */
 	public static void beforeChunkPublished(LevelChunk chunk) {
-		if (!prepare(chunk.getLevel())) {
+		Minecraft minecraft = Minecraft.getInstance();
+		if (!CavefillConfig.allows(minecraft)) {
+			catchUp = true;
+			return;
+		}
+		if (catchUp || level == null) {
+			catchUp = true;
+			publishCatchUp(minecraft);
 			return;
 		}
 		ENGINE.publishAndWait(ChunkSnapshot.capture(chunk), playerView());
@@ -62,6 +75,9 @@ public final class CavefillController {
 	 * Both hook HEAD, so this has to run first.
 	 */
 	public static void beforeChunkSnapshotted() {
+		if (level == null || !CavefillConfig.allows(Minecraft.getInstance())) {
+			return;
+		}
 		if (!prepare(Minecraft.getInstance().level)) {
 			return;
 		}
@@ -96,9 +112,24 @@ public final class CavefillController {
 		solverDirty = true;
 	}
 
-	public static void onClientTick(Minecraft minecraft) {
-		if (!prepare(minecraft.level)) {
+	public static void onConfigChanged() {
+		Minecraft minecraft = Minecraft.getInstance();
+		if (!CavefillConfig.allows(minecraft)) {
+			noteInactive(minecraft);
 			return;
+		}
+		if (catchUp || level == null) {
+			publishCatchUp(minecraft);
+		}
+	}
+
+	public static void onClientTick(Minecraft minecraft) {
+		if (!CavefillConfig.allows(minecraft)) {
+			noteInactive(minecraft);
+			return;
+		}
+		if (catchUp || level == null) {
+			publishCatchUp(minecraft);
 		}
 		if (ENGINE.flushFinished()) {
 			ENGINE.finishFlush();
@@ -112,6 +143,59 @@ public final class CavefillController {
 	public static boolean isFake(BlockPos pos) {
 		Long2ObjectOpenHashMap<BlockState> blocks = originals.get(chunkKey(pos.getX() >> 4, pos.getZ() >> 4));
 		return blocks != null && blocks.containsKey(pos.asLong());
+	}
+
+	private static void noteInactive(Minecraft minecraft) {
+		if (level != null) {
+			deactivate();
+		}
+		if (minecraft.level instanceof ClientLevel client && !client.isDebug() && minecraft.player != null) {
+			catchUp = true;
+		} else if (minecraft.level == null) {
+			catchUp = false;
+		}
+	}
+
+	private static void deactivate() {
+		restoreAll();
+		ENGINE.resetAndWait();
+		applied.clear();
+		originals.clear();
+		blockEntities.clear();
+		solverDirty = false;
+		level = null;
+	}
+
+	private static void restoreAll() {
+		if (level == null || applied.isEmpty()) {
+			return;
+		}
+		long[] keys = applied.keySet().toLongArray();
+		List<SectionFill> clears = new ArrayList<>(keys.length);
+		for (long key : keys) {
+			clears.add(new SectionFill(key, SectionPos.x(key), SectionPos.y(key), SectionPos.z(key), new BitSet(4096)));
+		}
+		apply(clears, null);
+	}
+
+	private static void publishCatchUp(Minecraft minecraft) {
+		if (!prepare(minecraft.level)) {
+			return;
+		}
+		catchUp = false;
+		publishLoaded((ClientLevel) minecraft.level);
+	}
+
+	private static void publishLoaded(ClientLevel client) {
+		Object storage = ((ClientChunkCacheAccessor) client.getChunkSource()).cavefill$storage();
+		AtomicReferenceArray<LevelChunk> chunks = ((ClientChunkStorageAccessor) storage).cavefill$chunks();
+		for (int index = 0; index < chunks.length(); index++) {
+			LevelChunk chunk = chunks.get(index);
+			if (chunk != null) {
+				ENGINE.publishAndWait(ChunkSnapshot.capture(chunk), playerView());
+			}
+		}
+		apply(ENGINE.drain(), null);
 	}
 
 	private static boolean prepare(Level current) {
