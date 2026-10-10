@@ -1,4 +1,4 @@
-package me.wolfii.effectivecaveculling;
+package me.wolfii.effectivecaveculling.config;
 
 import java.util.Optional;
 import net.minecraft.SharedConstants;

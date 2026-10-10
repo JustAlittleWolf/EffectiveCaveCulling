@@ -1,4 +1,4 @@
-package me.wolfii.effectivecaveculling;
+package me.wolfii.effectivecaveculling.config;
 
 import dev.isxander.yacl3.api.ButtonOption;
 import dev.isxander.yacl3.api.ConfigCategory;

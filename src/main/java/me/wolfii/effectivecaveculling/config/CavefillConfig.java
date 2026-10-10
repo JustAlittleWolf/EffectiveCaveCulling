@@ -1,4 +1,7 @@
-package me.wolfii.effectivecaveculling;
+package me.wolfii.effectivecaveculling.config;
+
+import me.wolfii.effectivecaveculling.Cavefill;
+import me.wolfii.effectivecaveculling.CavefillController;
 
 import dev.isxander.yacl3.config.v2.api.ConfigClassHandler;
 import dev.isxander.yacl3.config.v2.api.SerialEntry;

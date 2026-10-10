@@ -18,7 +18,7 @@
 			"me.wolfii.effectivecaveculling.CavefillClient"
 		],
 		"modmenu": [
-			"me.wolfii.effectivecaveculling.CavefillModMenu"
+			"me.wolfii.effectivecaveculling.config.CavefillModMenu"
 		]
 	},
 	"mixins": [

@@ -1,5 +1,6 @@
 package me.wolfii.effectivecaveculling;
 
+import me.wolfii.effectivecaveculling.config.CavefillConfig;
 import me.wolfii.effectivecaveculling.engine.CaveEngine;
 import me.wolfii.effectivecaveculling.engine.ChunkSnapshot;
 import me.wolfii.effectivecaveculling.engine.PlayerView;

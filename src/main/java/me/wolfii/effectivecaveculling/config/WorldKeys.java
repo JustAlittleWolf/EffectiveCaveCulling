@@ -1,4 +1,4 @@
-package me.wolfii.effectivecaveculling;
+package me.wolfii.effectivecaveculling.config;
 
 import com.google.common.net.HostAndPort;
 import java.util.Collection;
