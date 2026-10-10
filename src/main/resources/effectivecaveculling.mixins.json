@@ -6,7 +6,9 @@
 		"defaultRequire": 1
 	},
 	"client": [
+		"ClientChunkCacheAccessor",
 		"ClientChunkCacheMixin",
+		"ClientChunkStorageAccessor",
 		"LevelChunkMixin",
 		"MultiPlayerGameModeMixin"
 	]
