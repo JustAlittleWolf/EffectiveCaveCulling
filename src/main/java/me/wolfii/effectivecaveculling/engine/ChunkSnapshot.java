@@ -1,10 +1,12 @@
 package me.wolfii.effectivecaveculling.engine;
 
+import me.wolfii.effectivecaveculling.Cavefill;
 import java.util.Arrays;
 import java.util.BitSet;
 import net.minecraft.core.SectionPos;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
+import net.minecraft.world.level.levelgen.Heightmap;
 
 /** Block masks captured on the client thread before the solver sees a chunk. */
 public final class ChunkSnapshot {
@@ -14,18 +16,20 @@ public final class ChunkSnapshot {
 	public final int maxY;
 	public final boolean hasSkyLight;
 	public final SectionSnapshot[] sections;
+	/**
+	 * Absolute Y of the first air block in each column, from {@code WORLD_SURFACE}.
+	 * Null when the chunk has no primed surface heightmap. Shared, not mutated.
+	 */
+	public final int[] firstOpenY;
 
-	private ChunkSnapshot(int chunkX, int chunkZ, int minY, int maxY, boolean hasSkyLight, SectionSnapshot[] sections) {
+	private ChunkSnapshot(int chunkX, int chunkZ, int minY, int maxY, boolean hasSkyLight, SectionSnapshot[] sections, int[] firstOpenY) {
 		this.chunkX = chunkX;
 		this.chunkZ = chunkZ;
 		this.minY = minY;
 		this.maxY = maxY;
 		this.hasSkyLight = hasSkyLight;
 		this.sections = sections;
-	}
-
-	public static ChunkSnapshot create(int chunkX, int chunkZ, int minY, int maxY, boolean hasSkyLight, SectionSnapshot[] sections) {
-		return new ChunkSnapshot(chunkX, chunkZ, minY, maxY, hasSkyLight, sections);
+		this.firstOpenY = firstOpenY;
 	}
 
 	public static ChunkSnapshot capture(LevelChunk chunk) {
@@ -37,20 +41,51 @@ public final class ChunkSnapshot {
 		int chunkX = chunk.getPos().x();
 		int chunkZ = chunk.getPos().z();
 		int count = maxSection - minSection + 1;
-		SectionSnapshot[] sections = new SectionSnapshot[count];
 		LevelChunkSection[] raw = chunk.getSections();
+		int[] firstOpenY = surface(chunk);
+		int maxOpen = Integer.MAX_VALUE;
+		if (firstOpenY != null) {
+			maxOpen = Integer.MIN_VALUE;
+			for (int open : firstOpenY) {
+				if (open > maxOpen) {
+					maxOpen = open;
+				}
+			}
+		}
 
+		SectionSnapshot[] kept = new SectionSnapshot[count];
+		int written = 0;
 		for (int i = 0; i < count; i++) {
 			int sy = minSection + i;
+			// Entirely above every column's surface. Cave mouths stay in the section that
+			// contains the terrain, and that section is still marked sky-connected.
+			if ((sy << 4) >= maxOpen) {
+				continue;
+			}
 			BitSets masks = readSection(raw[i]);
 			long key = SectionPos.asLong(chunkX, sy, chunkZ);
-			sections[i] = new SectionSnapshot(key, chunkX, sy, chunkZ, masks.passable, masks.sky);
+			kept[written++] = new SectionSnapshot(key, chunkX, sy, chunkZ, masks.passable, masks.sky);
 		}
+		SectionSnapshot[] sections = written == count ? kept : Arrays.copyOf(kept, written);
 
 		if (hasSkyLight) {
 			paintSky(sections);
 		}
-		return new ChunkSnapshot(chunkX, chunkZ, minY, maxY, hasSkyLight, sections);
+		return new ChunkSnapshot(chunkX, chunkZ, minY, maxY, hasSkyLight, sections, firstOpenY);
+	}
+
+	/** First air Y per column, or null if the client chunk has no surface heightmap yet. */
+	private static int[] surface(LevelChunk chunk) {
+		if (!chunk.hasPrimedHeightmap(Heightmap.Types.WORLD_SURFACE)) {
+			return null;
+		}
+		int[] firstOpenY = new int[256];
+		for (int z = 0; z < 16; z++) {
+			for (int x = 0; x < 16; x++) {
+				firstOpenY[(z << 4) | x] = chunk.getHeight(Heightmap.Types.WORLD_SURFACE, x, z) + 1;
+			}
+		}
+		return firstOpenY;
 	}
 
 	/** Recompute the sky column after a single block edit. */
@@ -97,7 +132,7 @@ public final class ChunkSnapshot {
 			for (int y = 0; y < 16; y++) {
 				for (int z = 0; z < 16; z++) {
 					for (int x = 0; x < 16; x++) {
-						if (!section.getBlockState(x, y, z).isSolidRender()) {
+						if (!Cavefill.occludes(section.getBlockState(x, y, z))) {
 							passable.set(Grid.index(x, y, z));
 						}
 					}

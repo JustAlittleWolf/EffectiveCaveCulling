@@ -8,6 +8,7 @@ import me.wolfii.effectivecaveculling.engine.SectionFill;
 import me.wolfii.effectivecaveculling.mixin.ClientChunkCacheAccessor;
 import me.wolfii.effectivecaveculling.mixin.ClientChunkStorageAccessor;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.longs.LongArrayList;
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.List;
@@ -26,6 +27,7 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
+import net.minecraft.world.level.lighting.LightEngine;
 import net.minecraft.world.phys.AABB;
 
 /**
@@ -37,13 +39,15 @@ public final class CavefillController {
 	private static final BlockState FILL = Blocks.CONCRETE.pick(DyeColor.RED).defaultBlockState();
 
 	private static final Long2ObjectOpenHashMap<BitSet> applied = new Long2ObjectOpenHashMap<>();
-	private static final Long2ObjectOpenHashMap<Long2ObjectOpenHashMap<BlockState>> originals = new Long2ObjectOpenHashMap<>();
-	private static final Long2ObjectOpenHashMap<Long2ObjectOpenHashMap<CompoundTag>> blockEntities = new Long2ObjectOpenHashMap<>();
+	private static final Long2ObjectOpenHashMap<OriginalColumn> originals = new Long2ObjectOpenHashMap<>();
+	/** Block positions whose light must be checked again after the server light packet is applied. */
+	private static final LongArrayList relight = new LongArrayList();
 
 	private static ClientLevel level;
 	private static boolean solverDirty;
 	/** Chunks arrived while the mod was off, so enabling has to read what is already loaded. */
 	private static boolean catchUp;
+	private static boolean spectating;
 
 	private CavefillController() {
 	}
@@ -69,13 +73,20 @@ public final class CavefillController {
 			publishLoaded((ClientLevel) minecraft.level);
 			catchUp = false;
 		}
+		// The packet just replaced this column, so the previous copy and fill mask are stale.
+		remember(chunk);
+		forgetApplied(chunk.getPos().x(), chunk.getPos().z());
 		ENGINE.publishAndWait(ChunkSnapshot.capture(chunk), playerView());
-		apply(ENGINE.drain(), chunk);
+		if (hideFills()) {
+			ENGINE.drain();
+		} else {
+			apply(ENGINE.drain(), chunk);
+		}
 	}
 
 	/**
 	 * Bobby shallow-copies on {@code drop} / view moves, and Voxy ingests there when Bobby is installed.
-	 * Both hook HEAD, so this has to run first.
+	 * Both hook HEAD, so this has to run first. An idle solver has nothing new to publish.
 	 */
 	public static void beforeChunkSnapshotted() {
 		if (level == null || !CavefillConfig.allows(Minecraft.getInstance())) {
@@ -84,16 +95,21 @@ public final class CavefillController {
 		if (!prepare(Minecraft.getInstance().level)) {
 			return;
 		}
+		if (!solverDirty && ENGINE.idle()) {
+			return;
+		}
 		ENGINE.flushAndWait(playerView());
-		apply(ENGINE.drain(), null);
+		if (hideFills()) {
+			ENGINE.drain();
+		} else {
+			apply(ENGINE.drain(), null);
+		}
 		solverDirty = false;
 	}
 
 	public static void afterChunkUnloaded(int chunkX, int chunkZ) {
-		long chunkKey = chunkKey(chunkX, chunkZ);
-		originals.remove(chunkKey);
-		blockEntities.remove(chunkKey);
-		applied.long2ObjectEntrySet().removeIf(entry -> SectionPos.x(entry.getLongKey()) == chunkX && SectionPos.z(entry.getLongKey()) == chunkZ);
+		originals.remove(chunkKey(chunkX, chunkZ));
+		forgetApplied(chunkX, chunkZ);
 		ENGINE.enqueueUnload(chunkX, chunkZ);
 	}
 
@@ -102,16 +118,29 @@ public final class CavefillController {
 			return;
 		}
 		long packed = pos.asLong();
-		long chunkKey = chunkKey(pos.getX() >> 4, pos.getZ() >> 4);
-		Long2ObjectOpenHashMap<BlockState> blocks = originals.get(chunkKey);
-		if (blocks != null && blocks.remove(packed) != null) {
-			Long2ObjectOpenHashMap<CompoundTag> tags = blockEntities.get(chunkKey);
-			if (tags != null) {
-				tags.remove(packed);
+		OriginalColumn copy = originals.get(chunkKey(pos.getX() >> 4, pos.getZ() >> 4));
+		if (copy != null) {
+			int index = chunk.getSectionIndex(pos.getY());
+			if (index >= 0 && index < copy.sections.length) {
+				copy.sections[index].setBlockState(pos.getX() & 15, pos.getY() & 15, pos.getZ() & 15, state);
 			}
-			clearAppliedBit(pos);
+			if (state.hasBlockEntity()) {
+				BlockEntity blockEntity = chunk.getBlockEntity(pos);
+				if (blockEntity != null) {
+					copy.blockEntities.put(packed, blockEntity.saveWithFullMetadata(chunk.getLevel().registryAccess()));
+				} else {
+					copy.blockEntities.remove(packed);
+				}
+			} else {
+				copy.blockEntities.remove(packed);
+			}
 		}
-		ENGINE.enqueueBlock(pos.getX(), pos.getY(), pos.getZ(), !state.isSolidRender());
+		boolean revealed = clearAppliedBit(pos);
+		if (revealed) {
+			ENGINE.enqueueReveal(pos.getX(), pos.getY(), pos.getZ(), !Cavefill.occludes(state));
+		} else {
+			ENGINE.enqueueBlock(pos.getX(), pos.getY(), pos.getZ(), !Cavefill.occludes(state));
+		}
 		solverDirty = true;
 	}
 
@@ -131,21 +160,46 @@ public final class CavefillController {
 			noteInactive(minecraft);
 			return;
 		}
+		syncSpectator(minecraft);
 		if (catchUp || level == null) {
 			publishCatchUp(minecraft);
 		}
 		if (ENGINE.flushFinished()) {
 			ENGINE.finishFlush();
-			apply(ENGINE.drain(), null);
+			if (hideFills()) {
+				ENGINE.drain();
+			} else {
+				apply(ENGINE.drain(), null);
+			}
 		}
 		if (solverDirty && ENGINE.startFlush(playerView())) {
 			solverDirty = false;
 		}
+		flushRelight();
 	}
 
 	public static boolean isFake(BlockPos pos) {
-		Long2ObjectOpenHashMap<BlockState> blocks = originals.get(chunkKey(pos.getX() >> 4, pos.getZ() >> 4));
-		return blocks != null && blocks.containsKey(pos.asLong());
+		BitSet bits = applied.get(SectionPos.asLong(pos));
+		if (bits == null) {
+			return false;
+		}
+		return bits.get(((pos.getY() & 15) << 8) | ((pos.getZ() & 15) << 4) | (pos.getX() & 15));
+	}
+
+	private static void syncSpectator(Minecraft minecraft) {
+		boolean spectator = minecraft.player != null && minecraft.player.isSpectator();
+		if (spectator == spectating) {
+			return;
+		}
+		spectating = spectator;
+		if (spectator) {
+			restoreAll();
+			return;
+		}
+		if (level != null) {
+			ENGINE.replayAndWait();
+			apply(ENGINE.drain(), null);
+		}
 	}
 
 	private static void noteInactive(Minecraft minecraft) {
@@ -168,8 +222,9 @@ public final class CavefillController {
 		ENGINE.resetAndWait();
 		applied.clear();
 		originals.clear();
-		blockEntities.clear();
+		relight.clear();
 		solverDirty = false;
+		spectating = false;
 		level = null;
 	}
 
@@ -198,11 +253,30 @@ public final class CavefillController {
 		AtomicReferenceArray<LevelChunk> chunks = ((ClientChunkStorageAccessor) storage).cavefill$chunks();
 		for (int index = 0; index < chunks.length(); index++) {
 			LevelChunk chunk = chunks.get(index);
-			if (chunk != null) {
-				ENGINE.publishAndWait(ChunkSnapshot.capture(chunk), playerView());
+			if (chunk == null) {
+				continue;
 			}
+			long key = chunkKey(chunk.getPos().x(), chunk.getPos().z());
+			originals.computeIfAbsent(key, ignored -> OriginalColumn.capture(chunk));
+			ENGINE.publishAndWait(ChunkSnapshot.capture(chunk), playerView());
 		}
-		apply(ENGINE.drain(), null);
+		if (hideFills()) {
+			ENGINE.drain();
+		} else {
+			apply(ENGINE.drain(), null);
+		}
+	}
+
+	private static boolean hideFills() {
+		if (spectating) {
+			return true;
+		}
+		var player = Minecraft.getInstance().player;
+		return player != null && player.isSpectator();
+	}
+
+	private static void remember(LevelChunk chunk) {
+		originals.put(chunkKey(chunk.getPos().x(), chunk.getPos().z()), OriginalColumn.capture(chunk));
 	}
 
 	private static boolean prepare(Level current) {
@@ -211,7 +285,8 @@ public final class CavefillController {
 				ENGINE.resetAndWait();
 				applied.clear();
 				originals.clear();
-				blockEntities.clear();
+				relight.clear();
+				spectating = false;
 				level = null;
 			}
 			return false;
@@ -220,7 +295,8 @@ public final class CavefillController {
 			ENGINE.resetAndWait();
 			applied.clear();
 			originals.clear();
-			blockEntities.clear();
+			relight.clear();
+			spectating = false;
 			level = client;
 		}
 		return Minecraft.getInstance().player != null;
@@ -256,7 +332,8 @@ public final class CavefillController {
 		BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
 		for (SectionFill fill : fills) {
 			LevelChunk chunk;
-			if (incoming != null && incoming.getPos().x() == fill.sectionX && incoming.getPos().z() == fill.sectionZ) {
+			boolean justPublished = incoming != null && incoming.getPos().x() == fill.sectionX && incoming.getPos().z() == fill.sectionZ;
+			if (justPublished) {
 				chunk = incoming;
 			} else {
 				chunk = level.getChunkSource().getChunk(fill.sectionX, fill.sectionZ, ChunkStatus.FULL, false);
@@ -265,38 +342,43 @@ public final class CavefillController {
 				continue;
 			}
 			int index = chunk.getSectionIndexFromSectionY(fill.sectionY);
-			if (index < 0 || index >= chunk.getSections().length) {
+			LevelChunkSection[] liveSections = chunk.getSections();
+			if (index < 0 || index >= liveSections.length) {
 				continue;
 			}
-			LevelChunkSection section = chunk.getSection(index);
+			OriginalColumn stored = originals.get(chunkKey(fill.sectionX, fill.sectionZ));
+			if (stored == null || index >= stored.sections.length) {
+				continue;
+			}
+			LevelChunkSection section = liveSections[index];
+			LevelChunkSection copy = stored.sections[index];
 			BitSet desired = (BitSet) fill.fill.clone();
 			BitSet current = applied.get(fill.sectionKey);
 			if (current == null) {
 				current = new BitSet(4096);
 			}
 			boolean wasEmpty = section.hasOnlyAir();
-			long chunkKey = chunkKey(fill.sectionX, fill.sectionZ);
-			Long2ObjectOpenHashMap<BlockState> stored = originals.computeIfAbsent(chunkKey, key -> new Long2ObjectOpenHashMap<>());
-			Long2ObjectOpenHashMap<CompoundTag> tags = blockEntities.computeIfAbsent(chunkKey, key -> new Long2ObjectOpenHashMap<>());
 
 			for (int bit = current.nextSetBit(0); bit >= 0; bit = current.nextSetBit(bit + 1)) {
 				if (desired.get(bit)) {
 					continue;
 				}
-				restore(chunk, section, fill, bit, pos, stored, tags);
+				restore(chunk, section, copy, stored, fill, bit, pos);
 			}
 			for (int bit = desired.nextSetBit(0); bit >= 0; bit = desired.nextSetBit(bit + 1)) {
 				if (current.get(bit)) {
 					continue;
 				}
-				seal(level, chunk, section, fill, bit, pos, stored, tags);
+				seal(chunk, section, stored, fill, bit, pos);
 			}
 			if (desired.isEmpty()) {
 				applied.remove(fill.sectionKey);
 			} else {
 				applied.put(fill.sectionKey, desired);
 			}
-			if (Minecraft.getInstance().level == level) {
+			// A chunk that has not been published yet is meshed from the filled section on load.
+			// Dirtying neighbors here remeshes the whole border on the client thread.
+			if (!justPublished && Minecraft.getInstance().level == level) {
 				if (wasEmpty != section.hasOnlyAir()) {
 					level.getChunkSource().onSectionEmptinessChanged(fill.sectionX, fill.sectionY, fill.sectionZ, section.hasOnlyAir());
 				}
@@ -306,74 +388,123 @@ public final class CavefillController {
 	}
 
 	private static void seal(
-		ClientLevel level,
 		LevelChunk chunk,
 		LevelChunkSection section,
+		OriginalColumn stored,
 		SectionFill fill,
 		int bit,
-		BlockPos.MutableBlockPos pos,
-		Long2ObjectOpenHashMap<BlockState> stored,
-		Long2ObjectOpenHashMap<CompoundTag> tags
+		BlockPos.MutableBlockPos pos
 	) {
-		int x = (fill.sectionX << 4) + (bit & 15);
-		int y = (fill.sectionY << 4) + ((bit >> 8) & 15);
-		int z = (fill.sectionZ << 4) + ((bit >> 4) & 15);
-		pos.set(x, y, z);
-		long packed = pos.asLong();
-		if (!stored.containsKey(packed)) {
-			BlockState current = chunk.getBlockState(pos);
-			stored.put(packed, current);
-			BlockEntity blockEntity = chunk.getBlockEntity(pos);
-			if (blockEntity != null) {
-				tags.put(packed, blockEntity.saveWithFullMetadata(level.registryAccess()));
-				chunk.removeBlockEntity(pos);
-			}
+		int localX = bit & 15;
+		int localY = (bit >> 8) & 15;
+		int localZ = (bit >> 4) & 15;
+		pos.set((fill.sectionX << 4) + localX, (fill.sectionY << 4) + localY, (fill.sectionZ << 4) + localZ);
+		BlockState previous = section.setBlockState(localX, localY, localZ, FILL);
+		BlockEntity blockEntity = chunk.getBlockEntity(pos);
+		if (blockEntity != null) {
+			stored.blockEntities.put(pos.asLong(), blockEntity.saveWithFullMetadata(chunk.getLevel().registryAccess()));
+			chunk.removeBlockEntity(pos);
 		}
-		section.setBlockState(x & 15, y & 15, z & 15, FILL);
+		if (previous != null && previous != FILL) {
+			noteLight(chunk, pos, previous, FILL);
+		}
 	}
 
 	private static void restore(
 		LevelChunk chunk,
 		LevelChunkSection section,
+		LevelChunkSection copy,
+		OriginalColumn stored,
 		SectionFill fill,
 		int bit,
-		BlockPos.MutableBlockPos pos,
-		Long2ObjectOpenHashMap<BlockState> stored,
-		Long2ObjectOpenHashMap<CompoundTag> tags
+		BlockPos.MutableBlockPos pos
 	) {
-		int x = (fill.sectionX << 4) + (bit & 15);
-		int y = (fill.sectionY << 4) + ((bit >> 8) & 15);
-		int z = (fill.sectionZ << 4) + ((bit >> 4) & 15);
-		pos.set(x, y, z);
-		long packed = pos.asLong();
-		BlockState original = stored.remove(packed);
-		CompoundTag tag = tags.remove(packed);
-		if (original == null) {
-			return;
-		}
-		section.setBlockState(x & 15, y & 15, z & 15, original);
+		int localX = bit & 15;
+		int localY = (bit >> 8) & 15;
+		int localZ = (bit >> 4) & 15;
+		pos.set((fill.sectionX << 4) + localX, (fill.sectionY << 4) + localY, (fill.sectionZ << 4) + localZ);
+		BlockState original = copy.getBlockState(localX, localY, localZ);
+		BlockState previous = section.setBlockState(localX, localY, localZ, original);
+		CompoundTag tag = stored.blockEntities.get(pos.asLong());
 		if (tag != null && original.hasBlockEntity()) {
-			BlockPos immutable = new BlockPos(x, y, z);
+			BlockPos immutable = pos.immutable();
 			BlockEntity blockEntity = BlockEntity.loadStatic(immutable, original, tag, chunk.getLevel().registryAccess());
 			if (blockEntity != null) {
 				chunk.addAndRegisterBlockEntity(blockEntity);
 			}
 		}
-	}
-
-	private static void clearAppliedBit(BlockPos pos) {
-		long key = SectionPos.asLong(pos);
-		BitSet bits = applied.get(key);
-		if (bits != null) {
-			bits.clear(((pos.getY() & 15) << 8) | ((pos.getZ() & 15) << 4) | (pos.getX() & 15));
+		if (previous != null) {
+			noteLight(chunk, pos, previous, original);
 		}
 	}
 
-	private static long chunkKey(int chunkX, int chunkZ) {
-		return ChunkPosOf(chunkX, chunkZ);
+	private static void noteLight(LevelChunk chunk, BlockPos pos, BlockState before, BlockState after) {
+		if (!LightEngine.hasDifferentLightProperties(before, after)) {
+			return;
+		}
+		if (chunk.getLevel().dimensionType().hasSkyLight()) {
+			chunk.getSkyLightSources().update(chunk, pos.getX() & 15, pos.getY(), pos.getZ() & 15);
+		}
+		chunk.getLevel().getChunkSource().getLightEngine().checkBlock(pos);
+		relight.add(pos.asLong());
 	}
 
-	private static long ChunkPosOf(int chunkX, int chunkZ) {
+	private static void flushRelight() {
+		if (relight.isEmpty() || level == null || Minecraft.getInstance().level != level) {
+			relight.clear();
+			return;
+		}
+		BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+		var engine = level.getChunkSource().getLightEngine();
+		for (int i = 0; i < relight.size(); i++) {
+			pos.set(relight.getLong(i));
+			engine.checkBlock(pos);
+		}
+		relight.clear();
+	}
+
+	private static boolean clearAppliedBit(BlockPos pos) {
+		long key = SectionPos.asLong(pos);
+		BitSet bits = applied.get(key);
+		if (bits == null) {
+			return false;
+		}
+		int bit = ((pos.getY() & 15) << 8) | ((pos.getZ() & 15) << 4) | (pos.getX() & 15);
+		boolean wasFilled = bits.get(bit);
+		bits.clear(bit);
+		return wasFilled;
+	}
+
+	private static void forgetApplied(int chunkX, int chunkZ) {
+		applied.long2ObjectEntrySet().removeIf(entry -> SectionPos.x(entry.getLongKey()) == chunkX && SectionPos.z(entry.getLongKey()) == chunkZ);
+	}
+
+	private static long chunkKey(int chunkX, int chunkZ) {
 		return net.minecraft.world.level.ChunkPos.pack(chunkX, chunkZ);
+	}
+
+	/** Section palette copy plus the block-entity tags needed to put the real column back. */
+	private static final class OriginalColumn {
+		final LevelChunkSection[] sections;
+		final Long2ObjectOpenHashMap<CompoundTag> blockEntities;
+
+		private OriginalColumn(LevelChunkSection[] sections, Long2ObjectOpenHashMap<CompoundTag> blockEntities) {
+			this.sections = sections;
+			this.blockEntities = blockEntities;
+		}
+
+		static OriginalColumn capture(LevelChunk chunk) {
+			LevelChunkSection[] raw = chunk.getSections();
+			LevelChunkSection[] sections = new LevelChunkSection[raw.length];
+			for (int i = 0; i < raw.length; i++) {
+				sections[i] = raw[i].copy();
+			}
+			Long2ObjectOpenHashMap<CompoundTag> tags = new Long2ObjectOpenHashMap<>();
+			var registries = chunk.getLevel().registryAccess();
+			for (var entry : chunk.getBlockEntities().entrySet()) {
+				tags.put(entry.getKey().asLong(), entry.getValue().saveWithFullMetadata(registries));
+			}
+			return new OriginalColumn(sections, tags);
+		}
 	}
 }
