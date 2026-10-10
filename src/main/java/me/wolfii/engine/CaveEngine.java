@@ -1,6 +1,6 @@
-package dev.justalittlewolf.cavefill.engine;
+package me.wolfii.engine;
 
-import dev.justalittlewolf.cavefill.Cavefill;
+import me.wolfii.Cavefill;
 import it.unimi.dsi.fastutil.ints.Int2ByteOpenHashMap;
 import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;

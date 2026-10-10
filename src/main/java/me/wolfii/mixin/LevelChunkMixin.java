@@ -1,6 +1,6 @@
-package dev.justalittlewolf.cavefill.mixin;
+package me.wolfii.mixin;
 
-import dev.justalittlewolf.cavefill.CavefillController;
+import me.wolfii.CavefillController;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunk;

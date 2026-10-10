@@ -1,4 +1,4 @@
-package dev.justalittlewolf.cavefill;
+package me.wolfii;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;

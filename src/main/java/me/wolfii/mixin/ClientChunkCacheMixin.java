@@ -1,7 +1,7 @@
-package dev.justalittlewolf.cavefill.mixin;
+package me.wolfii.mixin;
 
 import com.llamalad7.mixinextras.sugar.Local;
-import dev.justalittlewolf.cavefill.CavefillController;
+import me.wolfii.CavefillController;
 import java.util.Map;
 import java.util.function.Consumer;
 import net.minecraft.client.multiplayer.ClientChunkCache;

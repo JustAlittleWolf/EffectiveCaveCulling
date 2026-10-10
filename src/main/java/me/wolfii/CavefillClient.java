@@ -1,4 +1,4 @@
-package dev.justalittlewolf.cavefill;
+package me.wolfii;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
